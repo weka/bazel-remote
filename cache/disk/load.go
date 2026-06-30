@@ -1,6 +1,7 @@
 package disk
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"math"
@@ -392,7 +393,7 @@ func (c *diskCache) scanDir() (scanResult, error) {
 		received <- struct{}{}
 	}()
 
-	dirListers := new(errgroup.Group)
+	dirListers, ctx := errgroup.WithContext(context.Background())
 
 	// compressed CAS items: <hash>-<logical size>-<random digits/ascii letters>
 	// uncompressed CAS items: <hash>-<logical size>-<random digits/ascii letters>.v1
@@ -546,7 +547,17 @@ func (c *diskCache) scanDir() (scanResult, error) {
 				return scanResult{}, fmt.Errorf("unexpected dir: %s", dirPath)
 			}
 
-			dc <- dirPath
+			// Use select so we bail out cleanly if a worker has returned an
+			// error and errgroup has cancelled the context. Without this, a
+			// worker error would leave us stuck sending into a full `dc`
+			// channel forever (the classic errgroup producer deadlock).
+			select {
+			case dc <- dirPath:
+			case <-ctx.Done():
+				close(dc)
+				dcClosed = true
+				return scanResult{}, dirListers.Wait()
+			}
 		}
 	}
 

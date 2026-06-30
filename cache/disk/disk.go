@@ -12,8 +12,11 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/buchgr/bazel-remote/v2/cache"
@@ -35,6 +38,36 @@ import (
 )
 
 var tfc = tempfile.NewCreator()
+
+// debugDirInfo returns "dir=<path> dir_inode=<N> dir_mtime=<T>" for the parent
+// directory of the given open file. Used to correlate write events with the
+// containing-directory dentry state across replicas of a shared filesystem.
+func debugDirInfo(f *os.File) string {
+	parent := filepath.Dir(f.Name())
+	info, err := os.Stat(parent)
+	if err != nil {
+		return fmt.Sprintf("dir=%s dir_stat_err=%v", parent, err)
+	}
+	var inode uint64
+	if st, ok := info.Sys().(*syscall.Stat_t); ok {
+		inode = st.Ino
+	}
+	return fmt.Sprintf("dir=%s dir_inode=%d dir_mtime=%s",
+		parent, inode, info.ModTime().UTC().Format(time.RFC3339Nano))
+}
+
+// debugInode returns the inode number of an open file, or 0 if unavailable.
+// Used only for debug logging of the write/fsync path.
+func debugInode(f *os.File) uint64 {
+	fi, err := f.Stat()
+	if err != nil {
+		return 0
+	}
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+		return st.Ino
+	}
+	return 0
+}
 
 var emptyZstdBlob = []byte{40, 181, 47, 253, 32, 0, 1, 0, 0}
 
@@ -179,6 +212,120 @@ func (c *diskCache) updateCacheAgeMetric() {
 	if validAge {
 		c.gaugeCacheAge.Set(age)
 	}
+}
+
+// fileNameRe matches a well-formed on-disk cache file name:
+//   compressed CAS:   <hash>-<size>-<random>
+//   uncompressed CAS: <hash>-<size>-<random>.v1
+//   AC / RAW:         <hash>-<random>
+// Mirrors the regex used in load.go scanDir().
+var fileNameRe = regexp.MustCompile(`^([a-f0-9]{64})(?:-([1-9][0-9]*))?-([0-9a-zA-Z]+)(\.v1)?$`)
+
+// findOnDisk scans the on-disk shard directory for a file matching the given
+// hash. It is the cross-replica fallback for shared_filesystem_mode: another
+// pod sharing the same WekaFS may have written a blob that isn't in this pod's
+// in-memory LRU yet. Returns a populated lruItem if found, nil otherwise.
+//
+// This is called only when the in-memory LRU misses, so the extra ReadDir cost
+// only happens on real cache lookups that didn't hit the in-memory index.
+//
+// Emits a DEBUG line on both HIT and MISS, with the same dir/dir_inode/dir_mtime
+// fields the writer side prints. The two can be cross-referenced to spot
+// cross-mount dentry-cache lag: if the writer just logged a fsync with
+// dir_mtime=T1 for a given dir_inode, and a sibling pod's findOnDisk MISS for
+// the same dir_inode reports dir_mtime=T0 (T0 < T1) or a missing entry that the
+// writer just created, the WekaFS client on the reader side hasn't propagated
+// the dentry yet.
+func (c *diskCache) findOnDisk(kind cache.EntryKind, hash string) *lruItem {
+	var kindDirName string
+	switch kind {
+	case cache.CAS:
+		kindDirName = "cas.v2"
+	case cache.AC:
+		kindDirName = "ac.v2"
+	case cache.RAW:
+		kindDirName = "raw.v2"
+	default:
+		return nil
+	}
+
+	shardDir := filepath.Join(c.dir, kindDirName, hash[:2])
+
+	// Stat the shard dir up front so we can emit dir_inode/dir_mtime even on
+	// the ReadDir error path. Errors here are also useful debug signal.
+	dirInfo, dirStatErr := os.Stat(shardDir)
+	dirDescr := fmt.Sprintf("dir=%s", shardDir)
+	if dirStatErr != nil {
+		dirDescr += fmt.Sprintf(" dir_stat_err=%v", dirStatErr)
+	} else {
+		var dirInode uint64
+		if st, ok := dirInfo.Sys().(*syscall.Stat_t); ok {
+			dirInode = st.Ino
+		}
+		dirDescr += fmt.Sprintf(" dir_inode=%d dir_mtime=%s",
+			dirInode, dirInfo.ModTime().UTC().Format(time.RFC3339Nano))
+	}
+
+	entries, err := os.ReadDir(shardDir)
+	if err != nil {
+		log.Printf("DEBUG findOnDisk MISS (readdir_err): hash=%s kind=%v %s readdir_err=%v",
+			hash, kind, dirDescr, err)
+		return nil
+	}
+
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		// Cheap prefix filter before the regex.
+		if !strings.HasPrefix(name, hash) {
+			continue
+		}
+		sm := fileNameRe.FindStringSubmatch(name)
+		if len(sm) != 5 || sm[1] != hash {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		item := lruItem{
+			sizeOnDisk: info.Size(),
+			random:     sm[3],
+			legacy:     sm[4] == ".v1",
+		}
+		// Default logical size to on-disk size; for v2 CAS the encoded size
+		// is in the filename (sm[2]).
+		item.size = item.sizeOnDisk
+		if len(sm[2]) > 0 {
+			if sz, err := strconv.ParseInt(sm[2], 10, 64); err == nil {
+				item.size = sz
+			}
+		}
+		var fileInode uint64
+		if st, ok := info.Sys().(*syscall.Stat_t); ok {
+			fileInode = st.Ino
+		}
+		log.Printf("DEBUG findOnDisk HIT: hash=%s kind=%v file=%s file_inode=%d size=%d %s entries=%d",
+			hash, kind, name, fileInode, item.size, dirDescr, len(entries))
+		return &item
+	}
+	log.Printf("DEBUG findOnDisk MISS: hash=%s kind=%v %s entries=%d",
+		hash, kind, dirDescr, len(entries))
+	return nil
+}
+
+// adoptFromDisk inserts an LRU entry discovered by findOnDisk into this pod's
+// in-memory LRU under the given lookup key. Safe to call concurrently — uses
+// the cache lock and tolerates a race where another goroutine already added it.
+func (c *diskCache) adoptFromDisk(key string, item lruItem) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, existing := c.lru.Get(key); existing != nil {
+		return
+	}
+	c.lru.Add(key, item)
 }
 
 func (c *diskCache) getElementPath(key string, value lruItem) string {
@@ -389,6 +536,7 @@ func (c *diskCache) writeAndCloseFile(ctx context.Context, r io.Reader, kind cac
 	if err != nil {
 		return -1, annotate.Err(ctx, "Failed to copy data to disk", err)
 	}
+	log.Printf("DEBUG write done: name=%s inode=%d size=%d %s", f.Name(), debugInode(f), sizeOnDisk, debugDirInfo(f))
 
 	if isSizeMismatch(sizeOnDisk, size) {
 		return -1, fmt.Errorf(
@@ -399,6 +547,7 @@ func (c *diskCache) writeAndCloseFile(ctx context.Context, r io.Reader, kind cac
 	if err != nil {
 		return -1, fmt.Errorf("failed to sync file to disk: %w", err)
 	}
+	log.Printf("DEBUG fsync done: name=%s inode=%d %s", f.Name(), debugInode(f), debugDirInfo(f))
 
 	err = writeCloser.Close()
 	if err != nil {
@@ -459,6 +608,24 @@ func (c *diskCache) availableOrTryProxy(kind cache.EntryKind, hash string, size 
 
 	key := cache.LookupKey(kind, hash)
 	item, listElem := c.lru.Get(key)
+
+	// Cross-replica fallback: if the LRU misses but we're in shared_storage_mode,
+	// look directly on disk before considering the proxy. Another pod may have
+	// written this blob to the shared FS without our LRU being told.
+	if listElem == nil && c.sharedStorageMode {
+		c.mu.Unlock()
+		locked = false
+		if onDisk := c.findOnDisk(kind, hash); onDisk != nil && !isSizeMismatch(size, onDisk.size) {
+			c.adoptFromDisk(key, *onDisk)
+			c.mu.Lock()
+			locked = true
+			item, listElem = c.lru.Get(key)
+		} else {
+			c.mu.Lock()
+			locked = true
+		}
+	}
+
 	if listElem != nil {
 		c.mu.Unlock() // We expect a cache hit below.
 		locked = false
@@ -796,6 +963,16 @@ func (c *diskCache) Contains(ctx context.Context, kind cache.EntryKind, hash str
 			}
 		} else {
 			return true, foundSize
+		}
+	}
+
+	// Cross-replica fallback: in shared_filesystem_mode another pod may have
+	// written this blob to the shared FS. Look directly on disk before falling
+	// through to the proxy (which can be slow or unavailable).
+	if c.sharedStorageMode {
+		if onDisk := c.findOnDisk(kind, hash); onDisk != nil && !isSizeMismatch(size, onDisk.size) {
+			c.adoptFromDisk(key, *onDisk)
+			return true, onDisk.size
 		}
 	}
 

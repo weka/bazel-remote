@@ -10,10 +10,43 @@ import (
 	"io"
 	"log"
 	"os"
+	"path/filepath"
 	"sync"
+	"syscall"
+	"time"
 
 	"github.com/buchgr/bazel-remote/v2/cache/disk/zstdimpl"
 )
+
+// debugInode returns the inode number of an open file, or 0 if unavailable.
+// Used only for debug logging of the write/fsync path.
+func debugInode(f *os.File) uint64 {
+	fi, err := f.Stat()
+	if err != nil {
+		return 0
+	}
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+		return st.Ino
+	}
+	return 0
+}
+
+// debugDirInfo returns "dir=<path> dir_inode=<N> dir_mtime=<T>" for the parent
+// directory of the given open file. Used to correlate write events with the
+// containing-directory dentry state across replicas of a shared filesystem.
+func debugDirInfo(f *os.File) string {
+	parent := filepath.Dir(f.Name())
+	info, err := os.Stat(parent)
+	if err != nil {
+		return fmt.Sprintf("dir=%s dir_stat_err=%v", parent, err)
+	}
+	var inode uint64
+	if st, ok := info.Sys().(*syscall.Stat_t); ok {
+		inode = st.Ino
+	}
+	return fmt.Sprintf("dir=%s dir_inode=%d dir_mtime=%s",
+		parent, inode, info.ModTime().UTC().Format(time.RFC3339Nano))
+}
 
 type CompressionType uint8
 
@@ -565,6 +598,7 @@ func WriteAndClose(zstd zstdimpl.ZstdImpl, r io.Reader, f *os.File, t Compressio
 		if err != nil {
 			return -1, err
 		}
+		log.Printf("DEBUG write done (casblob identity): name=%s inode=%d size=%d %s", f.Name(), debugInode(f), n, debugDirInfo(f))
 		if n != size {
 			return -1, fmt.Errorf("expected to copy %d bytes, actually copied %d bytes",
 				size, n)
@@ -580,6 +614,7 @@ func WriteAndClose(zstd zstdimpl.ZstdImpl, r io.Reader, f *os.File, t Compressio
 		if err := f.Sync(); err != nil {
 			return -1, fmt.Errorf("failed to sync file: %w", err)
 		}
+		log.Printf("DEBUG fsync done (casblob identity): name=%s inode=%d %s", f.Name(), debugInode(f), debugDirInfo(f))
 
 		return n + fileOffset, f.Close()
 	}
@@ -650,11 +685,13 @@ func WriteAndClose(zstd zstdimpl.ZstdImpl, r io.Reader, f *os.File, t Compressio
 	if err != nil {
 		return -1, fmt.Errorf("failed to write chunk offsets: %w", err)
 	}
+	log.Printf("DEBUG write done (casblob zstd): name=%s inode=%d size=%d %s", f.Name(), debugInode(f), fileOffset, debugDirInfo(f))
 
 	err = f.Sync()
 	if err != nil {
 		return -1, fmt.Errorf("failed to sync file: %w", err)
 	}
+	log.Printf("DEBUG fsync done (casblob zstd): name=%s inode=%d %s", f.Name(), debugInode(f), debugDirInfo(f))
 
 	err = f.Close()
 	if err != nil {
