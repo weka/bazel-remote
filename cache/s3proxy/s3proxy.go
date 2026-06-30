@@ -161,8 +161,12 @@ func logResponse(log cache.Logger, method, bucket, key string, err error) {
 }
 
 // objectKeyPrefixSharedFS returns the prefix to search for objects in shared filesystem mode.
-// In this mode, files are stored with local disk naming convention: <hash>-<size>-<random>
-// so we need to list objects with this prefix to find them.
+// In this mode, bazel-remote writes objects with the local disk naming convention
+// "<hash>-<size>-<random>", but the shared filesystem/bucket may also contain bare
+// "<hash>" objects (e.g. synced in by another writer). We list by the bare hash (no
+// trailing "-") so reads match BOTH forms: "<hash>" and "<hash>-<size>-<random>".
+// The hash is a full 64-char sha256, so this prefix can only match objects for this
+// exact blob (it cannot prefix-collide with a different hash).
 func objectKeyPrefixSharedFS(prefix string, hash string, kind cache.EntryKind) string {
 	var kindDir string
 	if kind == cache.CAS {
@@ -173,8 +177,8 @@ func objectKeyPrefixSharedFS(prefix string, hash string, kind cache.EntryKind) s
 		kindDir = "raw.v2"
 	}
 
-	// Prefix for listing: <kindDir>/<hash[:2]>/<hash>-
-	baseKey := path.Join(kindDir, hash[:2], hash) + "-"
+	// Prefix for listing: <kindDir>/<hash[:2]>/<hash>
+	baseKey := path.Join(kindDir, hash[:2], hash)
 
 	if prefix == "" {
 		return baseKey

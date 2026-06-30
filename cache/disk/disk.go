@@ -12,8 +12,11 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/buchgr/bazel-remote/v2/cache"
@@ -220,6 +223,15 @@ func (c *diskCache) FileLocationBase(kind cache.EntryKind, legacy bool, hash str
 }
 
 func (c *diskCache) FileLocation(kind cache.EntryKind, legacy bool, hash string, size int64, random string) string {
+	// Deterministic naming (random == ""): the final path is computed
+	// identically by every replica, so a blob written by one instance can be
+	// located by another via a direct stat -- no need to know the writer's
+	// random suffix. Legacy random-suffixed files (written before this scheme,
+	// or discovered on disk) still resolve via their stored random suffix.
+	if random == "" {
+		return c.FileLocationBase(kind, legacy, hash, size)
+	}
+
 	if kind == cache.RAW {
 		return path.Join("raw.v2", hash[:2], hash+"-"+random)
 	}
@@ -410,10 +422,98 @@ func (c *diskCache) writeAndCloseFile(ctx context.Context, r io.Reader, kind cac
 	return sizeOnDisk, nil
 }
 
+// flockShard takes an advisory lock on the shard directory (e.g. cas.v2/<hh>)
+// that holds the blob for `hash`, returning a release func. Writers use
+// exclusive=true (LOCK_EX) around the create/rename; readers use false
+// (LOCK_SH) around their existence stat. On a shared WekaFS this serves two
+// purposes that plain stat can't: a reader's LOCK_SH blocks until an in-flight
+// writer in that shard releases (so we don't observe a half-done write), and
+// the lock handoff acts as a cross-node coherency point so the writer's freshly
+// created directory entry is flushed/visible to the reader's node -- the
+// writecache/forcedirect modes otherwise lag many seconds under load.
+//
+// Shard dirs are pre-existing (created at startup) so both sides can open them
+// without creating anything, and there are only 256 per kind so lock files
+// don't proliferate. Best-effort: on any error we return a no-op release rather
+// than failing the cache operation.
+func (c *diskCache) flockShard(kind cache.EntryKind, hash string, exclusive bool) func() {
+	dirPath := filepath.Join(c.dir, kind.DirName(), hash[:2])
+	f, err := os.Open(dirPath)
+	if err != nil {
+		return func() {}
+	}
+	how := syscall.LOCK_SH
+	if exclusive {
+		how = syscall.LOCK_EX
+	}
+	if err := syscall.Flock(int(f.Fd()), how); err != nil {
+		_ = f.Close()
+		return func() {}
+	}
+	return func() {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		_ = f.Close()
+	}
+}
+
+// keyToKindHash splits an LRU key (e.g. "cas/<hash>") into its kind and hash.
+func keyToKindHash(key string) (cache.EntryKind, string) {
+	hash := key[len(key)-sha256HashStrSize:]
+	switch {
+	case strings.HasPrefix(key, "cas"):
+		return cache.CAS, hash
+	case strings.HasPrefix(key, "raw"):
+		return cache.RAW, hash
+	default:
+		return cache.AC, hash
+	}
+}
+
 // This must be called when the lock is not held.
+//
+// The freshly-written temp file (which has a unique random suffix only to avoid
+// write collisions) is renamed to its deterministic final name so that any
+// replica sharing this filesystem can locate it by a direct stat. The `random`
+// parameter is therefore unused for the final name.
 func (c *diskCache) commit(key string, legacy bool, tempfile string, reservedSize int64, logicalSize int64, sizeOnDisk int64, random string) (unreserve bool, removeTempfile bool, err error) {
 	unreserve = reservedSize > 0
 	removeTempfile = true
+
+	kind, hash := keyToKindHash(key)
+	finalPath := filepath.Join(c.dir, c.FileLocationBase(kind, legacy, hash, logicalSize))
+
+	// Hold an exclusive lock on the shard dir across the rename. Releasing it
+	// acts as a cross-node coherency point so the new entry is promptly visible
+	// to other replicas (writecache/forcedirect otherwise lag under load), and
+	// it makes concurrent readers (LOCK_SH) wait rather than observe a partial
+	// state. Gated to shared-storage mode; no-op/best-effort otherwise.
+	releaseShard := func() {}
+	if c.sharedStorageMode {
+		releaseShard = c.flockShard(kind, hash, true)
+	}
+
+	if err = os.Rename(tempfile, finalPath); err != nil {
+		releaseShard()
+		log.Println(err.Error())
+		return unreserve, removeTempfile, err
+	}
+	// Flush the parent directory so the new entry is pushed to the shared
+	// backend, then release the shard lock (the release is the coherency point).
+	if dirFile, derr := os.Open(filepath.Dir(finalPath)); derr == nil {
+		_ = dirFile.Sync()
+		_ = dirFile.Close()
+	}
+	releaseShard()
+	// The temp file no longer exists under its original name; if indexing fails
+	// below, the final file is the one to clean up (removeTempfile is for the
+	// caller's stray-temp cleanup, which no longer applies).
+	removeTempfile = false
+	removeFinal := true
+	defer func() {
+		if removeFinal {
+			_ = os.Remove(finalPath)
+		}
+	}()
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -422,7 +522,7 @@ func (c *diskCache) commit(key string, legacy bool, tempfile string, reservedSiz
 		err = c.lru.Unreserve(reservedSize)
 		if err != nil {
 			log.Println(err.Error())
-			return true, removeTempfile, err
+			return true, false, err
 		}
 	}
 	unreserve = false
@@ -431,20 +531,20 @@ func (c *diskCache) commit(key string, legacy bool, tempfile string, reservedSiz
 		size:       logicalSize,
 		sizeOnDisk: sizeOnDisk,
 		legacy:     legacy,
-		random:     random,
+		random:     "", // deterministic name (see FileLocation)
 	}
 
 	if !c.lru.Add(key, newItem) {
 		err = fmt.Errorf("INTERNAL ERROR: failed to add: %s, size %d (on disk: %d)",
 			key, logicalSize, sizeOnDisk)
 		log.Println(err.Error())
-		return unreserve, removeTempfile, err
+		return unreserve, false, err
 	}
 
-	removeTempfile = false
+	removeFinal = false
 
 	// Commit successful if we made it this far! \o/
-	return unreserve, removeTempfile, nil
+	return unreserve, false, nil
 }
 
 // Return a non-nil io.ReadCloser and non-negative size if the item is available
@@ -452,12 +552,106 @@ func (c *diskCache) commit(key string, legacy bool, tempfile string, reservedSiz
 // but that we can try the proxy backend.
 //
 // This function assumes that only CAS blobs are requested in zstd form.
+// blobFileRe parses a blob filename: <hash>[-<logicalSize>]-<random>[.v1].
+var blobFileRe = regexp.MustCompile(`^([a-f0-9]{64})(?:-([1-9][0-9]*))?-([0-9a-zA-Z]+)(\.v1)?$`)
+
+// discoverAndIndex looks for a blob on the (shared) filesystem that is not yet
+// in this instance's in-memory index -- typically one written by another
+// instance. It first checks the deterministic path (which every instance
+// computes identically, so a direct stat reliably finds another replica's
+// write), then falls back to the legacy random-suffixed naming for files
+// written before the deterministic scheme. If found, it is indexed. Returns
+// true if an entry for the hash is present in the index afterwards.
+//
+// This is what makes a multi-instance shared_storage_mode deployment coherent
+// without depending on a proxy backend: a read miss in the local index falls
+// back to the actual directory contents, by a name every replica agrees on.
+func (c *diskCache) discoverAndIndex(kind cache.EntryKind, hash string, size int64) bool {
+	legacy := kind == cache.CAS && c.storageMode == casblob.Identity
+	key := cache.LookupKey(kind, hash)
+
+	addItem := func(item lruItem) bool {
+		c.mu.Lock()
+		if _, present := c.lru.Get(key); present == nil {
+			c.lru.Add(key, item)
+		}
+		c.mu.Unlock()
+		return true
+	}
+
+	// Deterministic name (no random suffix). For CAS we need the size to build
+	// the path; if it is unknown we fall through to the glob below.
+	if kind != cache.CAS || size > 0 {
+		// Take a shared lock on the shard dir for the stat: if a writer is
+		// mid-write in this shard we wait for it to release, and the lock
+		// acquire is a cross-node coherency point so we see the writer's fresh
+		// entry rather than a stale "missing". Gated to shared-storage mode.
+		release := func() {}
+		if c.sharedStorageMode {
+			release = c.flockShard(kind, hash, false)
+		}
+		det := filepath.Join(c.dir, c.FileLocationBase(kind, legacy, hash, size))
+		info, statErr := os.Stat(det)
+		release()
+		if statErr == nil && !info.IsDir() {
+			item := lruItem{sizeOnDisk: info.Size(), size: size, legacy: legacy}
+			if kind != cache.CAS {
+				item.size = info.Size()
+			}
+			return addItem(item)
+		}
+	}
+
+	// Fallback: legacy random-suffixed files already on disk.
+	matches, err := filepath.Glob(filepath.Join(c.dir, kind.DirName(), hash[:2], hash+"-*"))
+	if err != nil || len(matches) == 0 {
+		return false
+	}
+	for _, m := range matches {
+		sm := blobFileRe.FindStringSubmatch(filepath.Base(m))
+		if len(sm) != 5 || sm[1] != hash {
+			continue
+		}
+
+		info, err := os.Stat(m)
+		if err != nil || info.IsDir() {
+			continue
+		}
+
+		item := lruItem{sizeOnDisk: info.Size(), size: info.Size(), random: sm[3], legacy: sm[4] == ".v1"}
+		if len(sm[2]) > 0 {
+			logicalSize, perr := strconv.ParseInt(sm[2], 10, 64)
+			if perr != nil {
+				continue
+			}
+			item.size = logicalSize
+		}
+		return addItem(item)
+	}
+
+	return false
+}
+
 func (c *diskCache) availableOrTryProxy(kind cache.EntryKind, hash string, size int64, offset int64, zstd bool) (io.ReadCloser, int64, bool, error) {
+	key := cache.LookupKey(kind, hash)
+
+	// Shared filesystem: another instance may have written this blob under a
+	// random suffix that is not in our in-memory index. Discover it on disk
+	// and index it so the lookup below can serve it. (A configured proxy is
+	// only a best-effort race-breaker here and need not reflect the filesystem.)
+	if c.sharedStorageMode {
+		c.mu.Lock()
+		_, present := c.lru.Get(key)
+		c.mu.Unlock()
+		if present == nil {
+			c.discoverAndIndex(kind, hash, size)
+		}
+	}
+
 	locked := true
 	var err error
 	c.mu.Lock()
 
-	key := cache.LookupKey(kind, hash)
 	item, listElem := c.lru.Get(key)
 	if listElem != nil {
 		c.mu.Unlock() // We expect a cache hit below.
@@ -772,6 +966,17 @@ func (c *diskCache) Contains(ctx context.Context, kind cache.EntryKind, hash str
 
 	foundSize := int64(-1)
 	key := cache.LookupKey(kind, hash)
+
+	// Shared filesystem: discover and index a blob written by another instance
+	// (different random suffix, absent from our index) before checking.
+	if c.sharedStorageMode {
+		c.mu.Lock()
+		_, present := c.lru.Get(key)
+		c.mu.Unlock()
+		if present == nil {
+			c.discoverAndIndex(kind, hash, size)
+		}
+	}
 
 	c.mu.Lock()
 	item, listElem := c.lru.Get(key)

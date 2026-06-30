@@ -394,10 +394,12 @@ func (c *diskCache) scanDir() (scanResult, error) {
 
 	dirListers := new(errgroup.Group)
 
-	// compressed CAS items: <hash>-<logical size>-<random digits/ascii letters>
-	// uncompressed CAS items: <hash>-<logical size>-<random digits/ascii letters>.v1
-	// AC and RAW items: <hash>-<random digits/ascii letters>
-	re := regexp.MustCompile(`^([a-f0-9]{64})(?:-([1-9][0-9]*))?-([0-9a-zA-Z]+)(\.v1)?$`)
+	// Blob filenames. Deterministic naming (no random suffix) plus the legacy
+	// random-suffixed naming that may still be on disk:
+	//   compressed CAS:   <hash>-<logical size>     (legacy: <hash>-<logical size>-<random>)
+	//   uncompressed CAS: <hash>                    (legacy: <hash>-<random>.v1)
+	//   AC and RAW:       <hash>                    (legacy: <hash>-<random>)
+	hashRe := regexp.MustCompile(`^[a-f0-9]{64}$`)
 
 	// Ignore lost+found dirs, which are automatically created in the
 	// root dir of some unix style filesystems.
@@ -449,12 +451,15 @@ func (c *diskCache) scanDir() (scanResult, error) {
 					fields := strings.Split(name, "/")
 					file := fields[len(fields)-1]
 
-					sm := re.FindStringSubmatch(file)
-					if len(sm) != 5 {
+					// Strip the legacy ".v1" (uncompressed CAS) suffix first.
+					legacy := strings.HasSuffix(file, ".v1")
+					base := strings.TrimSuffix(file, ".v1")
+
+					parts := strings.Split(base, "-")
+					hash := parts[0]
+					if !hashRe.MatchString(hash) {
 						return fmt.Errorf("unrecognized file: %q", path.Join(dirName, name))
 					}
-
-					hash := sm[1]
 
 					item[n] = &item_values[n]
 					metadata[n] = &metadata_values[n]
@@ -462,21 +467,41 @@ func (c *diskCache) scanDir() (scanResult, error) {
 					metadata[n].lookupKey = lookupKeyPrefix + hash
 
 					item[n].sizeOnDisk = info.Size()
-					item[n].size = item[n].sizeOnDisk
-					if len(sm[2]) > 0 {
-						item[n].size, err = strconv.ParseInt(sm[2], 10, 64)
+					item[n].size = info.Size()
+					item[n].random = ""
+					item[n].legacy = legacy
+
+					if lookupKeyPrefix == "cas/" && !legacy {
+						// compressed CAS: <hash>-<size> (deterministic) or
+						// <hash>-<size>-<random> (legacy); a bare <hash> is a
+						// deterministic uncompressed (legacy-format) blob.
+						switch len(parts) {
+						case 1:
+							item[n].legacy = true
+						case 2:
+							item[n].size, err = strconv.ParseInt(parts[1], 10, 64)
+						case 3:
+							item[n].size, err = strconv.ParseInt(parts[1], 10, 64)
+							item[n].random = parts[2]
+						default:
+							return fmt.Errorf("unrecognized file: %q", path.Join(dirName, name))
+						}
 						if err != nil {
-							return fmt.Errorf("failed to parse int from %q in file %q: %w",
-								sm[2], path.Join(dirName, name), err)
+							return fmt.Errorf("failed to parse size from %q: %w",
+								path.Join(dirName, name), err)
+						}
+					} else {
+						// AC, RAW, or legacy uncompressed CAS:
+						// <hash> (deterministic) or <hash>-<random>.
+						switch len(parts) {
+						case 1:
+							// deterministic; random stays "".
+						case 2:
+							item[n].random = parts[1]
+						default:
+							return fmt.Errorf("unrecognized file: %q", path.Join(dirName, name))
 						}
 					}
-
-					item[n].random = sm[3]
-					if len(item[n].random) == 0 {
-						return fmt.Errorf("unrecognized file (no random string): %q", path.Join(dirName, name))
-					}
-
-					item[n].legacy = sm[4] == ".v1"
 
 					metadata[n].ts = atime.Get(info)
 
