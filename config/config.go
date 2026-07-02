@@ -130,6 +130,7 @@ type Config struct {
 	SharedStorageMode           bool                      `yaml:"shared_storage_mode"`
 	SharedStorageLeader         bool                      `yaml:"shared_storage_leader"`
 	SharedStorageGCInterval     time.Duration             `yaml:"shared_storage_gc_interval"`
+	SharedStorageGCMinAge       time.Duration             `yaml:"shared_storage_gc_min_age"`
 
 	// Fields that are created by combinations of the flags above.
 	ProxyBackend cache.Proxy
@@ -191,7 +192,8 @@ func newFromArgs(dir string, maxSize int, storageMode string, zstdImplementation
 	maxProxyBlobSize int64,
 	sharedStorageMode bool,
 	sharedStorageLeader bool,
-	sharedStorageGCInterval time.Duration) (*Config, error) {
+	sharedStorageGCInterval time.Duration,
+	sharedStorageGCMinAge time.Duration) (*Config, error) {
 
 	c := Config{
 		HTTPAddress:                 httpAddress,
@@ -233,6 +235,7 @@ func newFromArgs(dir string, maxSize int, storageMode string, zstdImplementation
 		SharedStorageMode:           sharedStorageMode,
 		SharedStorageLeader:         sharedStorageLeader,
 		SharedStorageGCInterval:     sharedStorageGCInterval,
+		SharedStorageGCMinAge:       sharedStorageGCMinAge,
 	}
 
 	err := validateConfig(&c)
@@ -692,5 +695,6 @@ func get(ctx *cli.Context) (*Config, error) {
 		ctx.Bool("shared_storage_mode"),
 		ctx.Bool("shared_storage_leader"),
 		ctx.Duration("shared_storage_gc_interval"),
+		ctx.Duration("shared_storage_gc_min_age"),
 	)
 }

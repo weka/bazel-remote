@@ -552,5 +552,12 @@ func GetCliFlags() []cli.Flag {
 			DefaultText: "5m",
 			EnvVars:     []string{"BAZEL_REMOTE_SHARED_STORAGE_GC_INTERVAL"},
 		},
+		&cli.DurationFlag{
+			Name:        "shared_storage_gc_min_age",
+			Usage:       "When running as shared storage leader, never evict blobs whose access time is younger than this. Protects blobs still referenced by in-flight builds. Values below 1h are raised to 1h.",
+			Value:       3600000000000, // 1 hour in nanoseconds
+			DefaultText: "1h",
+			EnvVars:     []string{"BAZEL_REMOTE_SHARED_STORAGE_GC_MIN_AGE"},
+		},
 	}
 }

@@ -1,7 +1,9 @@
 package disk
 
 import (
+	"context"
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"os"
@@ -19,6 +21,9 @@ import (
 	"github.com/buchgr/bazel-remote/v2/cache/disk/casblob"
 	"github.com/buchgr/bazel-remote/v2/cache/disk/zstdimpl"
 	"github.com/buchgr/bazel-remote/v2/utils/validate"
+
+	pb "github.com/buchgr/bazel-remote/v2/genproto/build/bazel/remote/execution/v2"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/djherbis/atime"
 
@@ -691,6 +696,8 @@ type fileWithAtime struct {
 	path  string
 	size  int64
 	atime time.Time
+	kind  cache.EntryKind
+	hash  string
 }
 
 // runSharedStorageLeaderGC runs the garbage collection loop for shared storage leader mode.
@@ -705,13 +712,26 @@ func (c *diskCache) runSharedStorageLeaderGC(maxSizeBytes int64) {
 		interval = 5 * time.Minute
 	}
 
-	log.Printf("Starting shared storage leader GC loop (interval: %v, max size: %.2f GB)",
-		interval, bytesToGigaBytes(maxSizeBytes))
+	log.Printf("Starting shared storage leader GC loop (interval: %v, min age: %v, max size: %.2f GB)",
+		interval, c.gcMinAge(), bytesToGigaBytes(maxSizeBytes))
 
 	ticker := time.NewTicker(interval)
 	for range ticker.C {
 		c.runGCCycle(maxSizeBytes)
 	}
+}
+
+// gcMinAge returns the minimum blob age that is protected from eviction.
+// Blobs whose access time is younger than this are never deleted, so a blob
+// still referenced by an in-flight build (whose reference is not visible to
+// the leader) is not evicted out from under it. Floored at 1h to safely
+// exceed both the longest build and WEKA's atime propagation lag.
+func (c *diskCache) gcMinAge() time.Duration {
+	minAge := c.sharedStorageGCMinAge
+	if minAge < time.Hour {
+		minAge = time.Hour
+	}
+	return minAge
 }
 
 // runGCCycle performs one garbage collection cycle
@@ -732,17 +752,50 @@ func (c *diskCache) runGCCycle(maxSizeBytes int64) {
 	log.Printf("Shared storage GC: current size %.2f GB exceeds limit %.2f GB, need to free %.2f GB",
 		bytesToGigaBytes(totalSize), bytesToGigaBytes(maxSizeBytes), bytesToGigaBytes(bytesToFree))
 
+	// Build the set of CAS blobs referenced by live Action Cache entries.
+	// These must never be evicted: as long as an action result is cached, its
+	// outputs must remain, or a client that gets an AC hit will fail to fetch
+	// the outputs mid-build. AC entries themselves are evictable (a missing AC
+	// entry is just a cache miss that re-runs the action), so orphaned outputs
+	// become collectable on a later cycle once their AC entry is gone.
+	referenced := c.collectACReferencedCASHashes()
+
 	// Sort files by atime (oldest first)
 	sort.Slice(files, func(i, j int) bool {
 		return files[i].atime.Before(files[j].atime)
 	})
 
+	// Never evict blobs accessed more recently than the min-age grace window.
+	// This protects blobs still referenced by in-flight builds, whose input
+	// references are not visible to the leader.
+	cutoff := time.Now().Add(-c.gcMinAge())
+
 	// Delete oldest files until we've freed enough space
 	var freed int64
 	var deletedCount int
+	var ageProtBytes int64
+	var ageProtCount int
+	var refProtBytes int64
+	var refProtCount int
 	for _, f := range files {
 		if freed >= bytesToFree {
 			break
+		}
+
+		// Blobs younger than the grace window are protected from eviction.
+		if f.atime.After(cutoff) {
+			ageProtBytes += f.size
+			ageProtCount++
+			continue
+		}
+
+		// CAS blobs referenced by a live AC entry are protected regardless of age.
+		if f.kind == cache.CAS && f.hash != "" {
+			if _, ok := referenced[f.hash]; ok {
+				refProtBytes += f.size
+				refProtCount++
+				continue
+			}
 		}
 
 		// Remove from our LRU if present (best effort, may not be in our index)
@@ -761,8 +814,98 @@ func (c *diskCache) runGCCycle(maxSizeBytes int64) {
 		deletedCount++
 	}
 
-	log.Printf("Shared storage GC: freed %.2f GB by deleting %d files",
-		bytesToGigaBytes(freed), deletedCount)
+	log.Printf("Shared storage GC: freed %.2f GB by deleting %d files (protected: %d AC-referenced, %d within min-age)",
+		bytesToGigaBytes(freed), deletedCount, refProtCount, ageProtCount)
+
+	if freed < bytesToFree {
+		log.Printf("Warning: shared storage GC could not free enough space: %.2f GB still over limit "+
+			"(%.2f GB AC-referenced, %.2f GB within %v min-age are protected). Consider raising max size.",
+			bytesToGigaBytes(bytesToFree-freed), bytesToGigaBytes(refProtBytes), bytesToGigaBytes(ageProtBytes), c.gcMinAge())
+	}
+}
+
+// collectACReferencedCASHashes scans the Action Cache and returns the set of
+// CAS blob hashes that are reachable from a cached ActionResult: its output
+// files, the tree blob (and the files within it) for each output directory,
+// and the stdout/stderr blobs. GC must not evict any of these while the
+// referencing AC entry exists.
+func (c *diskCache) collectACReferencedCASHashes() map[string]struct{} {
+	referenced := make(map[string]struct{})
+	acDir := filepath.Join(c.dir, "ac.v2")
+
+	_ = filepath.Walk(acDir, func(p string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return nil
+		}
+
+		data, err := os.ReadFile(p)
+		if err != nil {
+			return nil
+		}
+
+		ar := &pb.ActionResult{}
+		if err := proto.Unmarshal(data, ar); err != nil {
+			return nil // Not a parseable ActionResult; skip.
+		}
+
+		for _, f := range ar.OutputFiles {
+			if f.Digest != nil {
+				referenced[f.Digest.Hash] = struct{}{}
+			}
+		}
+		for _, d := range ar.OutputDirectories {
+			if d.TreeDigest != nil {
+				referenced[d.TreeDigest.Hash] = struct{}{}
+				c.markTreeFiles(d.TreeDigest, referenced)
+			}
+		}
+		if ar.StdoutDigest != nil {
+			referenced[ar.StdoutDigest.Hash] = struct{}{}
+		}
+		if ar.StderrDigest != nil {
+			referenced[ar.StderrDigest.Hash] = struct{}{}
+		}
+		return nil
+	})
+
+	return referenced
+}
+
+// markTreeFiles reads the CAS tree blob identified by treeDigest and adds the
+// hashes of all files it contains to the referenced set. Best effort: if the
+// tree blob is unavailable or unparseable, its file references are skipped.
+func (c *diskCache) markTreeFiles(treeDigest *pb.Digest, referenced map[string]struct{}) {
+	r, _, err := c.Get(context.Background(), cache.CAS, treeDigest.Hash, treeDigest.SizeBytes, 0)
+	if r == nil || err != nil {
+		if r != nil {
+			_ = r.Close()
+		}
+		return
+	}
+	defer func() { _ = r.Close() }()
+
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return
+	}
+
+	tree := &pb.Tree{}
+	if err := proto.Unmarshal(data, tree); err != nil {
+		return
+	}
+
+	for _, f := range tree.Root.GetFiles() {
+		if f.Digest != nil {
+			referenced[f.Digest.Hash] = struct{}{}
+		}
+	}
+	for _, child := range tree.GetChildren() {
+		for _, f := range child.GetFiles() {
+			if f.Digest != nil {
+				referenced[f.Digest.Hash] = struct{}{}
+			}
+		}
+	}
 }
 
 // scanFilesWithAtime scans the cache directory and returns all files with their atimes
@@ -774,6 +917,16 @@ func (c *diskCache) scanFilesWithAtime() ([]fileWithAtime, int64, error) {
 	for _, kindDir := range []string{"ac.v2", "cas.v2", "raw.v2"} {
 		baseDir := filepath.Join(c.dir, kindDir)
 
+		var kind cache.EntryKind
+		switch kindDir {
+		case "ac.v2":
+			kind = cache.AC
+		case "cas.v2":
+			kind = cache.CAS
+		default:
+			kind = cache.RAW
+		}
+
 		err := filepath.Walk(baseDir, func(path string, info os.FileInfo, err error) error {
 			if err != nil {
 				return nil // Skip errors, continue walking
@@ -783,10 +936,17 @@ func (c *diskCache) scanFilesWithAtime() ([]fileWithAtime, int64, error) {
 				return nil
 			}
 
+			hash := ""
+			if name := info.Name(); len(name) >= sha256HashStrSize {
+				hash = name[:sha256HashStrSize]
+			}
+
 			files = append(files, fileWithAtime{
 				path:  path,
 				size:  info.Size(),
 				atime: atime.Get(info),
+				kind:  kind,
+				hash:  hash,
 			})
 			totalSize += info.Size()
 

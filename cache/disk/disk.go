@@ -98,6 +98,7 @@ type diskCache struct {
 	sharedStorageMode       bool
 	sharedStorageLeader     bool
 	sharedStorageGCInterval time.Duration
+	sharedStorageGCMinAge   time.Duration
 }
 
 const sha256HashStrSize = sha256.Size * 2 // Two hex characters per byte.
@@ -712,6 +713,7 @@ func (c *diskCache) availableOrTryProxy(kind cache.EntryKind, hash string, size 
 					c.lru.RemoveElement(listElem)
 					c.mu.Unlock()
 				} else {
+					c.touchAtime(blobPath)
 					return rc, item.size, false, nil
 				}
 			} else {
@@ -727,6 +729,7 @@ func (c *diskCache) availableOrTryProxy(kind cache.EntryKind, hash string, size 
 					log.Printf("Warning: expected %s to on disk to have size %d, found %d",
 						blobPath, size, foundSize)
 				} else {
+					c.touchAtime(blobPath)
 					_, err = f.Seek(offset, io.SeekStart)
 					return f, foundSize, false, err
 				}
@@ -761,6 +764,25 @@ func (c *diskCache) availableOrTryProxy(kind cache.EntryKind, hash string, size 
 	}
 
 	return nil, -1, tryProxy, err
+}
+
+// touchAtime advances the on-disk access time of a served blob so the
+// shared-storage leader GC (which ranks eviction candidates by atime) sees
+// real, cross-pod access recency. WEKA's default relatime only bumps atime on
+// the first read after a write, so without this an actively-referenced blob
+// keeps its creation-time atime and looks cold. Best-effort and asynchronous:
+// it never blocks or fails a cache hit. Passing a zero mtime leaves mtime
+// unchanged (Go >=1.24).
+func (c *diskCache) touchAtime(blobPath string) {
+	if !c.sharedStorageMode {
+		return
+	}
+	now := time.Now()
+	go func() {
+		if err := os.Chtimes(blobPath, now, time.Time{}); err != nil && !os.IsNotExist(err) {
+			log.Printf("Warning: failed to update atime for %q: %v", blobPath, err)
+		}
+	}()
 }
 
 var errOnlyCompressedCAS = &cache.Error{
@@ -997,6 +1019,7 @@ func (c *diskCache) Contains(ctx context.Context, kind cache.EntryKind, hash str
 				c.mu.Unlock()
 				exists = false
 			} else {
+				c.touchAtime(blobPath)
 				return true, foundSize
 			}
 		} else {

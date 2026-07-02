@@ -139,3 +139,10 @@ func WithSharedStorageGCInterval(interval time.Duration) Option {
 		return nil
 	}
 }
+
+func WithSharedStorageGCMinAge(minAge time.Duration) Option {
+	return func(cc *CacheConfig) error {
+		cc.diskCache.sharedStorageGCMinAge = minAge
+		return nil
+	}
+}
