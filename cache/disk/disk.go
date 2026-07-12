@@ -618,6 +618,14 @@ func (c *diskCache) statAndIndexCAS(hash string, size int64) bool {
 		return false
 	}
 
+	// FindMissingBlobs means "about to be used". If this blob has aged out of
+	// the GC grace window it is evictable in the check->fetch gap, so refresh
+	// its atime back into protection. Within the grace it is already safe --
+	// skip the setattr. We already have the stat, so the age check is free.
+	if time.Since(atime.Get(info)) > c.gcMinAge() {
+		c.touchAtime(det)
+	}
+
 	key := cache.LookupKey(cache.CAS, hash)
 	item := lruItem{sizeOnDisk: info.Size(), size: size, legacy: legacy}
 	c.mu.Lock()
