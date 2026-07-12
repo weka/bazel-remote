@@ -604,6 +604,30 @@ func (c *diskCache) discoverAndIndex(kind cache.EntryKind, hash string, size int
 	return false
 }
 
+// statAndIndexCAS checks for a CAS blob at its deterministic path with a plain
+// stat (no shard flock) and indexes it on hit. Used by FindMissingBlobs, where
+// dropping the flock is deliberate: unlike the read path, a stale cross-node
+// miss here is harmless -- the client just re-uploads an already-present blob
+// (idempotent) -- so the flock's per-blob backend round-trip isn't worth it.
+// Returns true if the blob is present on the shared filesystem.
+func (c *diskCache) statAndIndexCAS(hash string, size int64) bool {
+	legacy := c.storageMode == casblob.Identity
+	det := filepath.Join(c.dir, c.FileLocationBase(cache.CAS, legacy, hash, size))
+	info, err := os.Stat(det)
+	if err != nil || info.IsDir() {
+		return false
+	}
+
+	key := cache.LookupKey(cache.CAS, hash)
+	item := lruItem{sizeOnDisk: info.Size(), size: size, legacy: legacy}
+	c.mu.Lock()
+	if _, present := c.lru.Get(key); present == nil {
+		c.lru.Add(key, item)
+	}
+	c.mu.Unlock()
+	return true
+}
+
 func (c *diskCache) availableOrTryProxy(kind cache.EntryKind, hash string, size int64, offset int64, zstd bool) (io.ReadCloser, int64, bool, error) {
 	key := cache.LookupKey(kind, hash)
 

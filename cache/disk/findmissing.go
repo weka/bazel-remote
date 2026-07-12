@@ -102,7 +102,7 @@ func (c *diskCache) findMissingCasBlobsInternal(ctx context.Context, blobs []*pb
 				if chunk[i] == nil {
 					continue
 				}
-				if chunk[i].SizeBytes > 0 && c.discoverAndIndex(cache.CAS, chunk[i].Hash, chunk[i].SizeBytes) {
+				if chunk[i].SizeBytes > 0 && c.statAndIndexCAS(chunk[i].Hash, chunk[i].SizeBytes) {
 					c.accessLogger.Printf("GRPC CAS HEAD %s OK", chunk[i].Hash)
 					chunk[i] = nil
 					continue
