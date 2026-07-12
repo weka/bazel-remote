@@ -12,8 +12,6 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"regexp"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -553,8 +551,6 @@ func (c *diskCache) commit(key string, legacy bool, tempfile string, reservedSiz
 // but that we can try the proxy backend.
 //
 // This function assumes that only CAS blobs are requested in zstd form.
-// blobFileRe parses a blob filename: <hash>[-<logicalSize>]-<random>[.v1].
-var blobFileRe = regexp.MustCompile(`^([a-f0-9]{64})(?:-([1-9][0-9]*))?-([0-9a-zA-Z]+)(\.v1)?$`)
 
 // discoverAndIndex looks for a blob on the (shared) filesystem that is not yet
 // in this instance's in-memory index -- typically one written by another
@@ -580,8 +576,10 @@ func (c *diskCache) discoverAndIndex(kind cache.EntryKind, hash string, size int
 		return true
 	}
 
-	// Deterministic name (no random suffix). For CAS we need the size to build
-	// the path; if it is unknown we fall through to the glob below.
+	// Deterministic name only. This version never commits a random-suffixed
+	// file (those are always in-progress .tmp writes, renamed to the base name
+	// on commit), so a direct stat of the base path is authoritative. For CAS
+	// we need the size to build the path; without it we can't locate the blob.
 	if kind != cache.CAS || size > 0 {
 		// Take a shared lock on the shard dir for the stat: if a writer is
 		// mid-write in this shard we wait for it to release, and the lock
@@ -601,40 +599,6 @@ func (c *diskCache) discoverAndIndex(kind cache.EntryKind, hash string, size int
 			}
 			return addItem(item)
 		}
-	}
-
-	// Fallback: legacy random-suffixed files already on disk.
-	matches, err := filepath.Glob(filepath.Join(c.dir, kind.DirName(), hash[:2], hash+"-*"))
-	if err != nil || len(matches) == 0 {
-		return false
-	}
-	for _, m := range matches {
-		base := filepath.Base(m)
-		// Skip in-progress temp writes: their committed name is the
-		// deterministic base (no random suffix), assigned by rename. Indexing
-		// a .tmp file risks reading a half-written blob (short/no header).
-		if strings.HasSuffix(base, ".tmp") {
-			continue
-		}
-		sm := blobFileRe.FindStringSubmatch(base)
-		if len(sm) != 5 || sm[1] != hash {
-			continue
-		}
-
-		info, err := os.Stat(m)
-		if err != nil || info.IsDir() {
-			continue
-		}
-
-		item := lruItem{sizeOnDisk: info.Size(), size: info.Size(), random: sm[3], legacy: sm[4] == ".v1"}
-		if len(sm[2]) > 0 {
-			logicalSize, perr := strconv.ParseInt(sm[2], 10, 64)
-			if perr != nil {
-				continue
-			}
-			item.size = logicalSize
-		}
-		return addItem(item)
 	}
 
 	return false
