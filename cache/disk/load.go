@@ -448,6 +448,11 @@ func (c *diskCache) scanDir() (scanResult, error) {
 						return fmt.Errorf("unexpected directory: %q", path.Join(dirName, name))
 					}
 
+					// In-progress or crash-orphaned temp writes; never index them.
+					if strings.HasSuffix(name, ".tmp") {
+						continue
+					}
+
 					info, err := de.Info()
 					if err != nil {
 						return fmt.Errorf("failed to get file info for %q: %w", path.Join(dirName, name), err)

@@ -609,7 +609,14 @@ func (c *diskCache) discoverAndIndex(kind cache.EntryKind, hash string, size int
 		return false
 	}
 	for _, m := range matches {
-		sm := blobFileRe.FindStringSubmatch(filepath.Base(m))
+		base := filepath.Base(m)
+		// Skip in-progress temp writes: their committed name is the
+		// deterministic base (no random suffix), assigned by rename. Indexing
+		// a .tmp file risks reading a half-written blob (short/no header).
+		if strings.HasSuffix(base, ".tmp") {
+			continue
+		}
+		sm := blobFileRe.FindStringSubmatch(base)
 		if len(sm) != 5 || sm[1] != hash {
 			continue
 		}

@@ -57,6 +57,11 @@ func (c *Creator) Create(base string, legacy bool) (*os.File, string, error) {
 		} else {
 			name = base + "-" + random
 		}
+		// Mark in-progress writes with a .tmp suffix so no reader/scanner can
+		// discover and index a half-written file (its committed name is the
+		// deterministic base, assigned by rename). blobFileRe rejects .tmp and
+		// the s3proxy prefix search skips it.
+		name = name + ".tmp"
 
 		f, err = os.OpenFile(name, flags, mode)
 		if err == nil {
