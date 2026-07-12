@@ -90,6 +90,31 @@ func (c *diskCache) findMissingCasBlobsInternal(ctx context.Context, blobs []*pb
 			continue
 		}
 
+		// Shared storage: a blob written by another replica lives on the shared
+		// filesystem but may be absent from our in-memory index. Resolve misses
+		// with a direct stat of the deterministic path (same FS, cheap) and index
+		// it, rather than falling to the S3 proxy -- that does a ListObjects per
+		// blob against the gateway, which is orders of magnitude slower and was
+		// the cause of multi-minute FindMissingBlobs. The stat is authoritative
+		// on a shared FS, so we never consult the proxy in this mode.
+		if c.sharedStorageMode {
+			for i := range chunk {
+				if chunk[i] == nil {
+					continue
+				}
+				if chunk[i].SizeBytes > 0 && c.discoverAndIndex(cache.CAS, chunk[i].Hash, chunk[i].SizeBytes) {
+					c.accessLogger.Printf("GRPC CAS HEAD %s OK", chunk[i].Hash)
+					chunk[i] = nil
+					continue
+				}
+				// Still missing on the shared FS.
+				if failFast {
+					return errMissingBlob
+				}
+			}
+			continue
+		}
+
 		if c.proxy == nil && failFast {
 			// There's no proxy, there are missing blobs from the local cache, and we are failing fast.
 			return errMissingBlob
