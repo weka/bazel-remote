@@ -211,13 +211,17 @@ func (c *diskCache) findMissingLocalCAS(blobs []*pb.Digest) int {
 
 		foundSize := int64(-1)
 		key = cache.LookupKey(cache.CAS, blobs[i].Hash)
-		item, listElem := c.lru.Get(key)
+		item, listElem, atimeDue := c.lru.GetWithAtimeRefresh(key)
 		if listElem != nil {
 			foundSize = item.size
 		}
 
 		if listElem != nil && !isSizeMismatch(blobs[i].SizeBytes, foundSize) {
 			c.accessLogger.Printf("GRPC CAS HEAD %s OK", blobs[i].Hash)
+			// LRU hit means "present and about to be used". Refresh the on-disk
+			// atime (throttled) so an actively-referenced blob stays out of the
+			// leader GC's eviction set.
+			c.maybeRefreshAtime(atimeDue, cache.CAS, blobs[i].Hash, item)
 			blobs[i] = nil
 		} else {
 			missing++

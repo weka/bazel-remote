@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"sync/atomic"
+	"time"
 
 	"github.com/buchgr/bazel-remote/v2/cache"
 	"github.com/prometheus/client_golang/prometheus"
@@ -36,6 +37,11 @@ type SizedLRU struct {
 	// SizedLRU will evict items as needed to maintain the total size of the
 	// cache below maxSize.
 	maxSize int64
+
+	// In shared storage mode, how long a blob's on-disk atime may go without a
+	// refresh before GetWithAtimeRefresh reports it due. Zero disables refresh
+	// tracking (non-shared mode). Set well below the GC min-age grace.
+	atimeRefreshInterval time.Duration
 
 	// Channel containing evicted entries removed from ll, but not yet
 	// removed from the file system.
@@ -172,6 +178,8 @@ func (c *SizedLRU) RegisterMetrics() {
 // most linux filesystems default to 4kb blocks.
 func (c *SizedLRU) Add(key string, value lruItem) (ok bool) {
 
+	value.lastAtimeRefresh = time.Now()
+
 	roundedUpSizeOnDisk := roundUp4k(value.sizeOnDisk)
 
 	if roundedUpSizeOnDisk > c.maxSize {
@@ -239,6 +247,28 @@ func (c *SizedLRU) Get(key string) (lruItem, *list.Element) {
 	}
 
 	return lruItem{}, nil
+}
+
+// GetWithAtimeRefresh is Get for shared-storage access paths. In addition to
+// the normal lookup it reports whether the blob's on-disk atime is due for a
+// refresh -- i.e. its last refresh is older than atimeRefreshInterval -- and
+// when so, stamps the entry (under the caller's lock) so the next check waits a
+// full interval. The caller performs the actual Chtimes. The interval is set
+// well below the GC min-age grace, so an actively-accessed blob's atime is
+// refreshed long before it could age into the eviction set. Must be called with
+// the diskCache mutex held (like all SizedLRU methods).
+func (c *SizedLRU) GetWithAtimeRefresh(key string) (lruItem, *list.Element, bool) {
+	item, ele := c.Get(key)
+	if ele == nil || c.atimeRefreshInterval <= 0 {
+		return item, ele, false
+	}
+
+	e := ele.Value.(*entry)
+	if time.Since(e.value.lastAtimeRefresh) <= c.atimeRefreshInterval {
+		return item, ele, false
+	}
+	e.value.lastAtimeRefresh = time.Now()
+	return item, ele, true
 }
 
 // Remove removes a (key, value) from the cache.

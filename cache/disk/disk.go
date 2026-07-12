@@ -66,6 +66,12 @@ type lruItem struct {
 	// If true, the blob is a raw CAS file (no header, uncompressed)
 	// with a ".v1" filename suffix.
 	legacy bool
+
+	// Wall-clock time this blob's on-disk atime was last refreshed (set on Add,
+	// and on GetWithAtimeRefresh when a refresh is triggered). Used in shared
+	// storage mode to throttle Chtimes: we refresh at most once per
+	// atimeRefreshInterval per blob instead of on every access.
+	lastAtimeRefresh time.Time
 }
 
 // diskCache is a filesystem-based LRU cache, with an optional backend proxy.
@@ -656,7 +662,7 @@ func (c *diskCache) availableOrTryProxy(kind cache.EntryKind, hash string, size 
 	var err error
 	c.mu.Lock()
 
-	item, listElem := c.lru.Get(key)
+	item, listElem, atimeDue := c.lru.GetWithAtimeRefresh(key)
 	if listElem != nil {
 		c.mu.Unlock() // We expect a cache hit below.
 		locked = false
@@ -716,7 +722,7 @@ func (c *diskCache) availableOrTryProxy(kind cache.EntryKind, hash string, size 
 					c.lru.RemoveElement(listElem)
 					c.mu.Unlock()
 				} else {
-					c.touchAtime(blobPath)
+					c.maybeRefreshAtime(atimeDue, kind, hash, item)
 					return rc, item.size, false, nil
 				}
 			} else {
@@ -732,7 +738,7 @@ func (c *diskCache) availableOrTryProxy(kind cache.EntryKind, hash string, size 
 					log.Printf("Warning: expected %s to on disk to have size %d, found %d",
 						blobPath, size, foundSize)
 				} else {
-					c.touchAtime(blobPath)
+					c.maybeRefreshAtime(atimeDue, kind, hash, item)
 					_, err = f.Seek(offset, io.SeekStart)
 					return f, foundSize, false, err
 				}
@@ -786,6 +792,27 @@ func (c *diskCache) touchAtime(blobPath string) {
 			log.Printf("Warning: failed to update atime for %q: %v", blobPath, err)
 		}
 	}()
+}
+
+// gcInterval returns the leader GC cycle period (default 5m). Used as the
+// throttle for atime refreshes: refreshing at most once per interval keeps a
+// blob's atime well inside the (larger) min-age grace between accesses.
+func (c *diskCache) gcInterval() time.Duration {
+	iv := c.sharedStorageGCInterval
+	if iv <= 0 {
+		iv = 5 * time.Minute
+	}
+	return iv
+}
+
+// maybeRefreshAtime refreshes a blob's on-disk atime when GetWithAtimeRefresh
+// reported it due (its last refresh older than atimeRefreshInterval). Keeps an
+// actively-accessed blob's atime fresh so it stays out of the leader's
+// atime-ranked GC eviction set, without a setattr on every access.
+func (c *diskCache) maybeRefreshAtime(due bool, kind cache.EntryKind, hash string, item lruItem) {
+	if due {
+		c.touchAtime(filepath.Join(c.dir, c.FileLocation(kind, item.legacy, hash, item.size, item.random)))
+	}
 }
 
 var errOnlyCompressedCAS = &cache.Error{
@@ -1004,7 +1031,7 @@ func (c *diskCache) Contains(ctx context.Context, kind cache.EntryKind, hash str
 	}
 
 	c.mu.Lock()
-	item, listElem := c.lru.Get(key)
+	item, listElem, atimeDue := c.lru.GetWithAtimeRefresh(key)
 	exists := listElem != nil
 	if exists {
 		foundSize = item.size
@@ -1022,7 +1049,7 @@ func (c *diskCache) Contains(ctx context.Context, kind cache.EntryKind, hash str
 				c.mu.Unlock()
 				exists = false
 			} else {
-				c.touchAtime(blobPath)
+				c.maybeRefreshAtime(atimeDue, kind, hash, item)
 				return true, foundSize
 			}
 		} else {

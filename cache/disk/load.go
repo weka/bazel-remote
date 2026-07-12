@@ -635,6 +635,13 @@ func (c *diskCache) loadExistingFiles(maxSizeBytes int64, cc CacheConfig) error 
 
 	c.lru = NewSizedLRU(maxSizeBytes, onEvict, len(result.item))
 
+	if c.sharedStorageMode {
+		// Refresh a blob's atime at most once per quarter of the GC grace, so an
+		// actively-accessed blob's atime never ages into the eviction set (worst
+		// case ~grace/2) while avoiding a setattr on every access.
+		c.lru.atimeRefreshInterval = c.gcMinAge() / 4
+	}
+
 	log.Printf("Will evict at max size: %.2f GB", bytesToGigaBytes(maxSizeBytes))
 
 	if cc.maxSizeHardLimit > 0 {
@@ -712,10 +719,7 @@ func (c *diskCache) runSharedStorageLeaderGC(maxSizeBytes int64) {
 		return
 	}
 
-	interval := c.sharedStorageGCInterval
-	if interval <= 0 {
-		interval = 5 * time.Minute
-	}
+	interval := c.gcInterval()
 
 	log.Printf("Starting shared storage leader GC loop (interval: %v, min age: %v, max size: %.2f GB)",
 		interval, c.gcMinAge(), bytesToGigaBytes(maxSizeBytes))
