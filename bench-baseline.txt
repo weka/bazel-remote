@@ -1,0 +1,45 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/buchgr/bazel-remote/v2/cache/disk
+cpu: Apple M3 Pro
+BenchmarkScanDir_10K
+    scan_bench_test.go:154: cache generation complete: 10000 files under /var/folders/gk/wx3vbs4s61b5z4wqqllh5pv40000gp/T/BenchmarkScanDir_10K1475389130/001
+2026/09/09 11:28:35 Scanning cache directory with 12 goroutines
+BenchmarkScanDir_10K-12                	       1	  22519542 ns/op
+BenchmarkScanDir_100K
+    scan_bench_test.go:154: cache generation complete: 100000 files under /var/folders/gk/wx3vbs4s61b5z4wqqllh5pv40000gp/T/BenchmarkScanDir_100K2427909852/001
+2026/09/09 11:28:45 Scanning cache directory with 12 goroutines
+BenchmarkScanDir_100K-12               	       1	 125681542 ns/op
+BenchmarkScanDir_1M
+    scan_bench_test.go:154:   generated 100000/1000000 files
+    scan_bench_test.go:154:   generated 200000/1000000 files
+    scan_bench_test.go:154:   generated 300000/1000000 files
+    scan_bench_test.go:154:   generated 400000/1000000 files
+    scan_bench_test.go:154:   generated 500000/1000000 files
+    scan_bench_test.go:154:   generated 600000/1000000 files
+    scan_bench_test.go:154:   generated 700000/1000000 files
+    scan_bench_test.go:154:   generated 800000/1000000 files
+    scan_bench_test.go:154:   generated 900000/1000000 files
+    scan_bench_test.go:154: cache generation complete: 1000000 files under /var/folders/gk/wx3vbs4s61b5z4wqqllh5pv40000gp/T/BenchmarkScanDir_1M1370142785/001
+2026/09/09 11:31:14 Scanning cache directory with 12 goroutines
+BenchmarkScanDir_1M-12                 	       1	8712921833 ns/op
+BenchmarkScanFilesWithAtime_10K
+    scan_bench_test.go:184: cache generation complete: 10000 files under /var/folders/gk/wx3vbs4s61b5z4wqqllh5pv40000gp/T/BenchmarkScanFilesWithAtime_10K3269464925/001
+BenchmarkScanFilesWithAtime_10K-12     	       1	  67146542 ns/op
+BenchmarkScanFilesWithAtime_100K
+    scan_bench_test.go:184: cache generation complete: 100000 files under /var/folders/gk/wx3vbs4s61b5z4wqqllh5pv40000gp/T/BenchmarkScanFilesWithAtime_100K378283011/001
+BenchmarkScanFilesWithAtime_100K-12    	       1	 366651542 ns/op
+BenchmarkScanFilesWithAtime_1M
+    scan_bench_test.go:184:   generated 100000/1000000 files
+    scan_bench_test.go:184:   generated 200000/1000000 files
+    scan_bench_test.go:184:   generated 300000/1000000 files
+    scan_bench_test.go:184:   generated 400000/1000000 files
+    scan_bench_test.go:184:   generated 500000/1000000 files
+    scan_bench_test.go:184:   generated 600000/1000000 files
+    scan_bench_test.go:184:   generated 700000/1000000 files
+    scan_bench_test.go:184:   generated 800000/1000000 files
+    scan_bench_test.go:184:   generated 900000/1000000 files
+    scan_bench_test.go:184: cache generation complete: 1000000 files under /var/folders/gk/wx3vbs4s61b5z4wqqllh5pv40000gp/T/BenchmarkScanFilesWithAtime_1M4220082855/001
+BenchmarkScanFilesWithAtime_1M-12      	       1	77714053542 ns/op
+PASS
+ok  	github.com/buchgr/bazel-remote/v2/cache/disk	781.125s

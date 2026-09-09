@@ -1,0 +1,103 @@
+# Local end-to-end benchmark harness for the WEKA fork of bazel-remote.
+#
+# Runs 1 leader + 2 followers in shared_storage_mode against a bind-mounted
+# ./cache-data directory (populated by gen_cache.py). Tunings differ from
+# production so we get fast feedback:
+#   --shared_storage_gc_interval=1m  (vs 5m in prod)
+#   --shared_storage_gc_min_age=5m   (vs 48h in prod — so GC actually evicts)
+#   --max_size=100 GB                (small so eviction fires quickly on synthetic cache)
+#
+# Ports are offset for each follower so all three run side-by-side.
+#
+# Usage:
+#   BAZEL_REMOTE_IMAGE=bazel-remote:baseline docker compose up -d --build
+#
+# Compose behavior (see https://docs.docker.com/reference/compose-file/build/):
+#   * The `build: ..` on the leader points at the fork root (Dockerfile there).
+#   * The `image:` tag on the leader is applied to the built image.
+#   * Followers reference the same `image:` tag and reuse the built image
+#     without re-building.
+#   * `docker compose build` (or `up --build`) rebuilds from the current
+#     working-tree source and re-tags.
+#   * Plain `docker compose up` uses whatever's currently tagged — good for
+#     re-running the same image against a fresh generated cache.
+#
+# Tag with a descriptive name (baseline, skip-stat, parallel-gc-scan, ...) —
+# NOT v19; that's a branch name and would conflate branch with code state.
+
+x-common-env: &common-env
+  GOMEMLIMIT: 4GiB
+  GOMAXPROCS: 4
+
+x-common-args: &common-args
+  - --dir=/cache/data
+  - --max_size=100
+  - --storage_mode=zstd
+  - --grpc_address=:9092
+  - --http_address=:8080
+  - --enable_endpoint_metrics
+  - --shared_storage_mode
+  - --shared_storage_gc_min_age=5m
+
+services:
+  leader:
+    # Build from the fork root (parent of ./benchmark) and tag with the
+    # value of BAZEL_REMOTE_IMAGE. Followers reference the same tag and
+    # reuse the built image without re-building.
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: ${BAZEL_REMOTE_IMAGE:-bazel-remote:current}
+    container_name: bazel-remote-bench-leader
+    command:
+      - --dir=/cache/data
+      - --max_size=100
+      - --storage_mode=zstd
+      - --grpc_address=:9092
+      - --http_address=:8080
+      - --enable_endpoint_metrics
+      - --shared_storage_mode
+      - --shared_storage_leader
+      - --shared_storage_gc_interval=1m
+      - --shared_storage_gc_min_age=5m
+    ports:
+      - "8080:8080"
+      - "9092:9092"
+    volumes:
+      - ./cache-data:/cache/data
+    environment: *common-env
+    # Weaker healthcheck than production — avoid liveness-triggered kills during scan.
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/status"]
+      interval: 30s
+      timeout: 30s
+      start_period: 30m
+      retries: 20
+
+  follower-1:
+    image: ${BAZEL_REMOTE_IMAGE:-bazel-remote:current}
+    container_name: bazel-remote-bench-follower-1
+    command: *common-args
+    ports:
+      - "8081:8080"
+      - "9093:9092"
+    volumes:
+      - ./cache-data:/cache/data
+    environment: *common-env
+    depends_on:
+      leader:
+        condition: service_started
+
+  follower-2:
+    image: ${BAZEL_REMOTE_IMAGE:-bazel-remote:current}
+    container_name: bazel-remote-bench-follower-2
+    command: *common-args
+    ports:
+      - "8082:8080"
+      - "9094:9092"
+    volumes:
+      - ./cache-data:/cache/data
+    environment: *common-env
+    depends_on:
+      leader:
+        condition: service_started
