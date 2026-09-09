@@ -3,9 +3,12 @@
 # Runs 1 leader + 2 followers in shared_storage_mode against a bind-mounted
 # ./cache-data directory (populated by gen_cache.py). Tunings differ from
 # production so we get fast feedback:
-#   --shared_storage_gc_interval=1m  (vs 5m in prod)
-#   --shared_storage_gc_min_age=5m   (vs 48h in prod — so GC actually evicts)
-#   --max_size=100 GB                (small so eviction fires quickly on synthetic cache)
+#   --shared_storage_gc_interval=1m           (vs 5m in prod)
+#   --shared_storage_gc_min_age=5m            (vs 48h in prod — so GC actually evicts)
+#   --max_size=${BAZEL_REMOTE_MAX_SIZE_GB:-1} (default 1 GB — low enough to be exceeded
+#                                              by a 100K-file synthetic cache (~5 GB
+#                                              logical) so GC actually fires. Override
+#                                              via env when scaling up to 1M/10M files.)
 #
 # Ports are offset for each follower so all three run side-by-side.
 #
@@ -31,7 +34,7 @@ x-common-env: &common-env
 
 x-common-args: &common-args
   - --dir=/cache/data
-  - --max_size=100
+  - --max_size=${BAZEL_REMOTE_MAX_SIZE_GB:-1}
   - --storage_mode=zstd
   - --grpc_address=:9092
   - --http_address=:8080
@@ -51,7 +54,7 @@ services:
     container_name: bazel-remote-bench-leader
     command:
       - --dir=/cache/data
-      - --max_size=100
+      - --max_size=${BAZEL_REMOTE_MAX_SIZE_GB:-1}
       - --storage_mode=zstd
       - --grpc_address=:9092
       - --http_address=:8080
