@@ -1,0 +1,7 @@
+# Synthetic cache produced by gen_cache.py — regenerated on every REGEN=1 run,
+# and can be many thousands of files (up to millions for 10M-scale runs).
+cache-data/
+
+# Log dumps from run_bench.sh
+bench-logs/
+*.log
