@@ -7,7 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"path"
@@ -72,6 +74,13 @@ type lruItem struct {
 	// storage mode to throttle Chtimes: we refresh at most once per
 	// atimeRefreshInterval per blob instead of on every access.
 	lastAtimeRefresh time.Time
+
+	// Wall-clock time this blob's backing file was last confirmed to exist.
+	// Only meaningful in shared storage mode, where the leader's GC unlinks
+	// files without notifying this replica, so an index hit is not proof the
+	// blob is still on disk. Zero means "never verified since it entered the
+	// index", which is the common case for entries built by the boot scan.
+	lastVerified time.Time
 }
 
 // diskCache is a filesystem-based LRU cache, with an optional backend proxy.
@@ -97,12 +106,34 @@ type diskCache struct {
 	lru SizedLRU
 
 	gaugeCacheAge prometheus.Gauge
+	// 1 when gaugeCacheAge holds a real measurement, 0 when the tail
+	// item could not be resolved. Lets dashboards distinguish "unknown"
+	// from a genuine value instead of reading a stale number as current.
+	gaugeCacheAgeValid prometheus.Gauge
+
+	// Leader-side GC instrumentation. Only registered when this replica is the
+	// shared-storage leader; followers never run a cycle.
+	gcMetrics *gcMetrics
 
 	// Shared storage mode settings for multiple replicas on shared filesystem
-	sharedStorageMode       bool
-	sharedStorageLeader     bool
-	sharedStorageGCInterval time.Duration
-	sharedStorageGCMinAge   time.Duration
+	sharedStorageMode        bool
+	sharedStorageLeader      bool
+	sharedStorageGCInterval  time.Duration
+	sharedStorageGCMinAge    time.Duration
+	sharedStorageACRefMaxAge time.Duration
+	// Byte size the leader's GC reclaims down to. Zero means "use the LRU's
+	// max size". See gcTargetBytes.
+	sharedStorageGCMaxSize int64
+
+	// Worker-pool sizes. Zero means "use the historical min(NumCPU, 16)".
+	// Split because the boot scan runs before readiness (no client traffic to
+	// disturb) while the GC pools run alongside live requests.
+	bootScanConcurrency int
+	gcConcurrency       int
+
+	// How often to re-check that an indexed blob still exists on disk before
+	// FindMissingBlobs reports it present. Zero disables the check.
+	sharedStorageVerifyInterval time.Duration
 }
 
 const sha256HashStrSize = sha256.Size * 2 // Two hex characters per byte.
@@ -127,6 +158,22 @@ func (c *diskCache) RegisterMetrics() {
 	c.lru.RegisterMetrics()
 
 	prometheus.MustRegister(c.gaugeCacheAge)
+	prometheus.MustRegister(c.gaugeCacheAgeValid)
+
+	// Registered on every replica, not just the leader: followers are where
+	// index drift actually bites, since the leader is the one doing the
+	// deleting. registerStaleCounterOnce guards against the duplicate
+	// registration that tests would otherwise trigger.
+	registerStaleCounterOnce.Do(func() {
+		prometheus.MustRegister(counterStaleIndexEntries)
+	})
+
+	// Leader-only. Followers never execute a GC cycle, so registering these
+	// everywhere would export permanent zeros and silently poison any sum()
+	// across replicas.
+	if c.sharedStorageLeader {
+		c.gcMetrics.register()
+	}
 
 	// Update the cache age metric on a static interval
 	// Note: this could be modeled as a GuageFunc that updates as needed
@@ -158,35 +205,76 @@ func (c *diskCache) pollCacheAge() {
 	}
 }
 
-// Get the idle time of the least-recently used item in the cache, and store the value in a metric
+// maxCacheAgeEvictions bounds how many stale LRU tail entries
+// updateCacheAgeMetric sheds in a single pass. In shared storage mode one
+// leader GC cycle can delete millions of consecutive tail entries; an unbounded
+// loop here would hold c.mu for a long time on the request path. At one pass
+// per minute a backlog still drains at ~1000 entries/hour, and each pass
+// publishes a usable value as soon as it reaches a live entry.
+const maxCacheAgeEvictions = 16
+
+// Get the idle time of the least-recently used item in the cache, and store the
+// value in a metric.
+//
+// In shared storage mode the leader's GC deletes files from the shared
+// filesystem without notifying other replicas, so this pod's LRU tail may point
+// at a file that no longer exists. Such an entry is shed so the metric can
+// advance to the next-oldest live item. Otherwise the same dead entry is
+// retried every minute forever and the gauge stays frozen at its last
+// successful reading -- observed in production, where a single deleted file
+// wedged this metric on three replicas for days while emitting one ERROR per
+// minute per pod.
 func (c *diskCache) updateCacheAgeMetric() {
-	c.mu.Lock()
-
-	key, value, ok := c.lru.getTailItem()
-	if !ok {
-		// No items in the cache.
+	for i := 0; i < maxCacheAgeEvictions; i++ {
+		c.mu.Lock()
+		key, value, ok := c.lru.getTailItem()
 		c.mu.Unlock()
-		return
+
+		if !ok {
+			// No items in the cache. Leave the previous value alone rather
+			// than publishing a misleading zero age.
+			return
+		}
+
+		f := c.getElementPath(key, value)
+
+		// Stat outside c.mu deliberately: on a network filesystem this can take
+		// milliseconds, and c.mu is the global cache lock taken by every request.
+		ts, err := atime.Stat(f)
+		if err == nil {
+			c.gaugeCacheAge.Set(time.Since(ts).Seconds())
+			c.gaugeCacheAgeValid.Set(1)
+			return
+		}
+
+		if !errors.Is(err, fs.ErrNotExist) {
+			// EIO/EACCES/ESTALE and friends: the entry may be perfectly valid
+			// and the filesystem merely unhappy, so do not evict on these.
+			// Losing an index entry for a legacy random-suffixed blob is
+			// unrecoverable -- discoverAndIndex only knows the deterministic
+			// path -- so an over-eager eviction here can create a permanent 404.
+			log.Printf("ERROR: failed to determine time of least recently used cache item: %v, unable to stat %s", err, f)
+			c.gaugeCacheAge.Set(math.NaN())
+			c.gaugeCacheAgeValid.Set(0)
+			return
+		}
+
+		c.mu.Lock()
+		// Re-check the tail before removing: a concurrent request may already
+		// have replaced or evicted it while the stat was in flight.
+		if curKey, _, stillThere := c.lru.getTailItem(); stillThere && curKey == key {
+			// NoEvict: the file is already gone, so there is nothing to unlink
+			// and nothing to charge to the eviction counters.
+			c.lru.RemoveKeyNoEvict(key)
+			counterStaleIndexEntries.WithLabelValues(stalePathCacheAge).Inc()
+		}
+		c.mu.Unlock()
 	}
 
-	age := 0.0
-	validAge := true
-
-	f := c.getElementPath(key, value)
-	ts, err := atime.Stat(f)
-
-	if err != nil {
-		log.Printf("ERROR: failed to determine time of least recently used cache item: %v, unable to stat %s", err, f)
-		validAge = false
-	} else {
-		age = time.Since(ts).Seconds()
-	}
-
-	c.mu.Unlock()
-
-	if validAge {
-		c.gaugeCacheAge.Set(age)
-	}
+	// Every attempt in this pass found a missing file. Publish "unknown" rather
+	// than leaving a stale value on the dashboard; the next tick keeps shedding.
+	c.gaugeCacheAge.Set(math.NaN())
+	c.gaugeCacheAgeValid.Set(0)
 }
 
 func (c *diskCache) getElementPath(key string, value lruItem) string {
@@ -797,6 +885,27 @@ func (c *diskCache) touchAtime(blobPath string) {
 // gcInterval returns the leader GC cycle period (default 5m). Used as the
 // throttle for atime refreshes: refreshing at most once per interval keeps a
 // blob's atime well inside the (larger) min-age grace between accesses.
+// gcTargetBytes is the size the leader's GC reclaims the shared filesystem down
+// to, which is deliberately NOT the same thing as the LRU's capacity.
+//
+// max_size bounds the in-memory index. Using it as the GC target too means that
+// whenever GC has work to do -- i.e. whenever the filesystem exceeds the target
+// -- the index is by construction too small to cover the filesystem, and the
+// oldest entries are evicted out of the index while their files remain on disk.
+// A replica then cannot serve blobs that are present, which on a shared
+// filesystem surfaces as a hard NOT FOUND for data that another replica serves
+// happily.
+//
+// Resolved here rather than via a flag default on purpose: NewFromYaml does not
+// populate defaults for the shared-storage settings, so a YAML-configured
+// deployment would otherwise silently get zero.
+func (c *diskCache) gcTargetBytes() int64 {
+	if c.sharedStorageGCMaxSize > 0 {
+		return c.sharedStorageGCMaxSize
+	}
+	return c.lru.MaxSize()
+}
+
 func (c *diskCache) gcInterval() time.Duration {
 	iv := c.sharedStorageGCInterval
 	if iv <= 0 {
@@ -1044,8 +1153,9 @@ func (c *diskCache) Contains(ctx context.Context, kind cache.EntryKind, hash str
 			blobPath := filepath.Join(c.dir, c.FileLocation(kind, item.legacy, hash, item.size, item.random))
 			if _, err := os.Stat(blobPath); os.IsNotExist(err) {
 				// File was deleted by leader GC, remove from LRU
+				counterStaleIndexEntries.WithLabelValues(stalePathContains).Inc()
 				c.mu.Lock()
-				c.lru.RemoveKey(key)
+				c.lru.RemoveKeyNoEvict(key)
 				c.mu.Unlock()
 				exists = false
 			} else {

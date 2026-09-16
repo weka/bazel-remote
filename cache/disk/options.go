@@ -146,3 +146,61 @@ func WithSharedStorageGCMinAge(minAge time.Duration) Option {
 		return nil
 	}
 }
+
+// WithSharedStorageGCMaxSize sets the size in bytes that the leader's GC
+// targets on the shared filesystem. Zero means "use the LRU's max size", which
+// preserves the previous behaviour where one value did both jobs.
+func WithSharedStorageGCMaxSize(sizeBytes int64) Option {
+	return func(cc *CacheConfig) error {
+		if sizeBytes < 0 {
+			return fmt.Errorf("shared storage GC max size must not be negative: %d", sizeBytes)
+		}
+		cc.diskCache.sharedStorageGCMaxSize = sizeBytes
+		return nil
+	}
+}
+
+// WithSharedStorageVerifyInterval sets how often FindMissingBlobs re-checks
+// that an indexed blob still exists on disk. Zero disables the check.
+func WithSharedStorageVerifyInterval(d time.Duration) Option {
+	return func(cc *CacheConfig) error {
+		if d < 0 {
+			return fmt.Errorf("shared storage verify interval must not be negative: %v", d)
+		}
+		cc.diskCache.sharedStorageVerifyInterval = d
+		return nil
+	}
+}
+
+// WithBootScanConcurrency sets the worker count for the startup index scan.
+// Zero keeps the historical min(NumCPU, 16).
+func WithBootScanConcurrency(n int) Option {
+	return func(cc *CacheConfig) error {
+		if n < 0 {
+			return fmt.Errorf("boot scan concurrency must not be negative: %d", n)
+		}
+		cc.diskCache.bootScanConcurrency = n
+		return nil
+	}
+}
+
+// WithGCConcurrency sets the worker count for the pools that run during a GC
+// cycle (filesystem scan, AC reference collection, unlink). Zero keeps the
+// historical min(NumCPU, 16). These run alongside client traffic, so raising
+// this trades request latency for GC throughput.
+func WithGCConcurrency(n int) Option {
+	return func(cc *CacheConfig) error {
+		if n < 0 {
+			return fmt.Errorf("GC concurrency must not be negative: %d", n)
+		}
+		cc.diskCache.gcConcurrency = n
+		return nil
+	}
+}
+
+func WithSharedStorageACRefMaxAge(maxAge time.Duration) Option {
+	return func(cc *CacheConfig) error {
+		cc.diskCache.sharedStorageACRefMaxAge = maxAge
+		return nil
+	}
+}

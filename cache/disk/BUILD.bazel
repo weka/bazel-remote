@@ -34,9 +34,16 @@ go_library(
 go_test(
     name = "go_default_test",
     srcs = [
+        "cache_age_test.go",
         "disk_test.go",
         "findmissing_test.go",
+        "findmissing_verify_test.go",
+        "gc_metrics_test.go",
+        "gc_target_test.go",
+        "gc_test.go",
         "lru_test.go",
+        "scan_bench_test.go",
+        "shared_storage_test.go",
     ],
     embed = [":go_default_library"],
     deps = [

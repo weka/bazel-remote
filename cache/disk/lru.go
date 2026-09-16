@@ -66,6 +66,7 @@ type SizedLRU struct {
 
 	onEvict EvictCallback
 
+	gaugeCacheItems          prometheus.Gauge
 	gaugeCacheSizeBytes      prometheus.Gauge
 	gaugeCacheSizeBytesLimit *prometheus.GaugeVec
 	gaugeCacheLogicalBytes   prometheus.Gauge
@@ -113,6 +114,11 @@ func NewSizedLRU(maxSize int64, onEvict EvictCallback, initialCapacity int) Size
 		cache:   make(map[interface{}]*list.Element, initialCapacity),
 		onEvict: onEvict,
 
+		gaugeCacheItems: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "bazel_remote_disk_cache_items",
+			Help: "Number of entries in the in-memory LRU index, refreshed every 30s. In shared storage mode this is deliberately NOT the number of files on disk: the index is capped by --max_size while the shared filesystem may legitimately hold more. Compare against bazel_remote_shared_gc_scanned_files to see the gap.",
+		}),
+
 		gaugeCacheSizeBytes: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "bazel_remote_disk_cache_size_bytes",
 			Help: "The peak number of bytes in the disk backend for the previous 30 second period.",
@@ -151,6 +157,7 @@ func NewSizedLRU(maxSize int64, onEvict EvictCallback, initialCapacity int) Size
 }
 
 func (c *SizedLRU) RegisterMetrics() {
+	prometheus.MustRegister(c.gaugeCacheItems)
 	prometheus.MustRegister(c.gaugeCacheSizeBytes)
 	prometheus.MustRegister(c.gaugeCacheSizeBytesLimit)
 	prometheus.MustRegister(c.gaugeCacheLogicalBytes)
@@ -277,6 +284,46 @@ func (c *SizedLRU) RemoveKey(key string) {
 		c.removeElement(elem)
 		c.gaugeCacheLogicalBytes.Set(float64(c.uncompressedSize))
 	}
+}
+
+// markVerified records that this entry's backing file was just confirmed to
+// exist on disk. Used to throttle existence checks in shared storage mode --
+// see diskCache.verifyDue.
+func (c *SizedLRU) markVerified(key string, at time.Time) {
+	if elem, hit := c.cache[key]; hit {
+		elem.Value.(*entry).value.lastVerified = at
+	}
+}
+
+// RemoveKeyNoEvict drops an index entry WITHOUT queueing an eviction.
+//
+// Use this when the backing file is known to be gone already -- either because
+// another replica's leader GC unlinked it on the shared filesystem, or because
+// this process just deleted it itself. Routing such a removal through
+// removeElement would:
+//
+//   - queue an onEvict callback that tries to os.Remove a nonexistent file,
+//     logging an error per entry (harmless but noisy, and a no-op in shared
+//     storage mode where onEvict returns early), and
+//   - add the entry's bytes to counterEvictedBytes and queuedEvictionsSize,
+//     inflating both. queuedEvictionsSize feeds
+//     calcTotalDiskSizeAndUpdatePeak, so at GC scale it can push the apparent
+//     total past maxSizeHardLimit and make Reserve start rejecting writes
+//     during every GC cycle.
+//
+// The size accounting is still adjusted, because the entry really is leaving
+// the index.
+func (c *SizedLRU) RemoveKeyNoEvict(key string) {
+	elem, hit := c.cache[key]
+	if !hit {
+		return
+	}
+	c.ll.Remove(elem)
+	kv := elem.Value.(*entry)
+	delete(c.cache, kv.key)
+	c.currentSize -= roundUp4k(kv.value.sizeOnDisk)
+	c.uncompressedSize -= roundUp4k(kv.value.size)
+	c.gaugeCacheLogicalBytes.Set(float64(c.uncompressedSize))
 }
 
 // Remove a *list.Element from the cache.
@@ -499,6 +546,11 @@ func (c *SizedLRU) calcTotalDiskSizeAndUpdatePeak(sizeOfNewFile int64) uint64 {
 
 // Note that diskCache.mu mutex must be held when invoking this method.
 func (c *SizedLRU) shiftToNextMetricPeriod() {
+	// Publish the entry count here rather than via a GaugeFunc or an increment
+	// on Add/removeElement: the former would take the global cache mutex on
+	// every scrape, the latter would touch a metric on every request. This
+	// ticker already holds the mutex on a timer, so the count is free.
+	c.gaugeCacheItems.Set(float64(len(c.cache)))
 	c.gaugeCacheSizeBytes.Set(float64(c.totalDiskSizePeak))
 	c.totalDiskSizePeak = uint64(c.currentSize) + uint64(c.queuedEvictionsSize.Load())
 }

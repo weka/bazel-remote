@@ -1,0 +1,30 @@
+# Never ship these into the docker build context — none are needed to
+# compile bazel-remote or the bulk-populate generator.
+
+# VCS
+.git
+.gitignore
+
+# Local build outputs (from `go build`).
+/bazel-remote
+/bulk-populate
+
+# Benchmark-generated caches and logs. `benchmark/cache-data/` can grow to
+# many GB when populated by run_bench.sh or the Go bench harness.
+benchmark/cache-data/
+benchmark/bench-logs/
+benchmark/*.log
+bench-baseline.txt
+
+# IDE / editor / OS junk
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# Test artifacts
+**/testdata_generated/
+**/*.log
+
+# Agent-created / session-specific files
+.claude/

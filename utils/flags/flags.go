@@ -559,5 +559,40 @@ func GetCliFlags() []cli.Flag {
 			DefaultText: "1h",
 			EnvVars:     []string{"BAZEL_REMOTE_SHARED_STORAGE_GC_MIN_AGE"},
 		},
+		&cli.DurationFlag{
+			Name:        "shared_storage_verify_interval",
+			Usage:       "When using shared_storage_mode, re-check that a blob still exists on disk before FindMissingBlobs reports it present, at most once per blob per this interval. The leader's GC deletes files without notifying other replicas, so an index hit alone is not proof the blob is there; a false 'present' makes the client skip its upload and the build fails later on fetch. Costs one stat per blob per interval against the shared filesystem. 0 (default) disables the check entirely, preserving the previous behaviour and cost.",
+			Value:       0,
+			DefaultText: "0 (disabled)",
+			EnvVars:     []string{"BAZEL_REMOTE_SHARED_STORAGE_VERIFY_INTERVAL"},
+		},
+		&cli.IntFlag{
+			Name:        "boot_scan_concurrency",
+			Usage:       "Number of goroutines used for the startup cache index scan. 0 uses the default of min(NumCPU, 16). This pool runs before the server is ready, so it does not compete with client requests and can be raised more aggressively than gc_concurrency.",
+			Value:       0,
+			DefaultText: "0 (min(NumCPU, 16))",
+			EnvVars:     []string{"BAZEL_REMOTE_BOOT_SCAN_CONCURRENCY"},
+		},
+		&cli.IntFlag{
+			Name:        "gc_concurrency",
+			Usage:       "Number of goroutines used by each phase of a garbage collection cycle (filesystem scan, AC reference collection, unlink). 0 uses the default of min(NumCPU, 16). These run concurrently with client traffic against the same filesystem, so raising this trades request latency for GC throughput.",
+			Value:       0,
+			DefaultText: "0 (min(NumCPU, 16))",
+			EnvVars:     []string{"BAZEL_REMOTE_GC_CONCURRENCY"},
+		},
+		&cli.Int64Flag{
+			Name:        "shared_storage_gc_max_size",
+			Usage:       "When running as shared storage leader, the size in GiB that garbage collection targets on the shared filesystem. Defaults to max_size when unset (0). Set this BELOW max_size so the in-memory index can cover the whole filesystem while GC still reclaims down to a smaller target: max_size caps the index, and an index smaller than the filesystem means this replica cannot serve blobs that are present on disk.",
+			Value:       0,
+			DefaultText: "0 (use max_size)",
+			EnvVars:     []string{"BAZEL_REMOTE_SHARED_STORAGE_GC_MAX_SIZE"},
+		},
+		&cli.DurationFlag{
+			Name:        "shared_storage_ac_ref_max_age",
+			Usage:       "When running as shared storage leader, AC entries older than this do not shield their CAS references from GC. Prevents ancient AC entries from pinning CAS blobs forever. Set to 0 to disable the age cap (legacy behavior: all AC entries shield).",
+			Value:       1209600000000000, // 14 days in nanoseconds
+			DefaultText: "336h (14d)",
+			EnvVars:     []string{"BAZEL_REMOTE_SHARED_STORAGE_AC_REF_MAX_AGE"},
+		},
 	}
 }

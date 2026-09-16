@@ -56,7 +56,7 @@ import (
 // Naming follows the fork's compressed-CAS convention (matches production layout
 // on oke-rnd's WekaFS — see cache/disk/load.go:530-585 for the walker):
 //
-//   <dir>/cas.v2/<hash[:2]>/<hash>-<size>-<random>
+//	<dir>/cas.v2/<hash[:2]>/<hash>-<size>-<random>
 //
 // Only ONE level of sharding (256 shards, not 256×256) — files sit directly
 // under the two-hex-char shard directory. scanDir walks two levels deep

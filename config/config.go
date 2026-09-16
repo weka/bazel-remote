@@ -131,6 +131,19 @@ type Config struct {
 	SharedStorageLeader         bool                      `yaml:"shared_storage_leader"`
 	SharedStorageGCInterval     time.Duration             `yaml:"shared_storage_gc_interval"`
 	SharedStorageGCMinAge       time.Duration             `yaml:"shared_storage_gc_min_age"`
+	SharedStorageACRefMaxAge    time.Duration             `yaml:"shared_storage_ac_ref_max_age"`
+	// Size in GiB that the leader's GC targets on the shared filesystem. 0
+	// means "use MaxSize". Kept separate from MaxSize because MaxSize also
+	// bounds the in-memory index: when the filesystem legitimately holds more
+	// than the GC target -- which it does by definition whenever GC has work to
+	// do -- a single value forces the index to be smaller than the filesystem,
+	// and blobs present on disk but absent from the index cannot be served.
+	SharedStorageGCMaxSize int64 `yaml:"shared_storage_gc_max_size"`
+	// Worker-pool sizes; 0 means the historical min(NumCPU, 16) default.
+	// 0 disables the FindMissingBlobs existence check (previous behaviour).
+	SharedStorageVerifyInterval time.Duration `yaml:"shared_storage_verify_interval"`
+	BootScanConcurrency         int           `yaml:"boot_scan_concurrency"`
+	GCConcurrency               int           `yaml:"gc_concurrency"`
 
 	// Fields that are created by combinations of the flags above.
 	ProxyBackend cache.Proxy
@@ -155,7 +168,20 @@ type YamlConfig struct {
 
 const disabledGRPCListener = "none"
 
-var defaultDurationBuckets = []float64{.5, 1, 2.5, 5, 10, 20, 40, 80, 160, 320}
+// The upstream default started at 0.5s, which put every sub-500ms request into
+// the first bucket. That is most of them: a healthy FindMissingBlobs or CAS
+// read answers in single-digit milliseconds, so p50, p95 and p99 all rendered
+// as "<= 0.5s" and were indistinguishable from each other. Latency on the hot
+// paths was effectively unmeasurable, which is how a FindMissingBlobs p99
+// problem went unquantified in production for months.
+//
+// The sub-second bounds below give millisecond resolution where the traffic
+// actually lives, while keeping the original long tail so a genuinely slow
+// request is still bucketed rather than clipped.
+var defaultDurationBuckets = []float64{
+	.001, .0025, .005, .01, .025, .05, .1, .25,
+	.5, 1, 2.5, 5, 10, 20, 40, 80, 160, 320,
+}
 
 // newFromArgs returns a validated Config with the specified values, and
 // an error if there were any problems with the validation.
@@ -193,7 +219,12 @@ func newFromArgs(dir string, maxSize int, storageMode string, zstdImplementation
 	sharedStorageMode bool,
 	sharedStorageLeader bool,
 	sharedStorageGCInterval time.Duration,
-	sharedStorageGCMinAge time.Duration) (*Config, error) {
+	sharedStorageGCMinAge time.Duration,
+	sharedStorageACRefMaxAge time.Duration,
+	sharedStorageGCMaxSize int64,
+	sharedStorageVerifyInterval time.Duration,
+	bootScanConcurrency int,
+	gcConcurrency int) (*Config, error) {
 
 	c := Config{
 		HTTPAddress:                 httpAddress,
@@ -236,6 +267,11 @@ func newFromArgs(dir string, maxSize int, storageMode string, zstdImplementation
 		SharedStorageLeader:         sharedStorageLeader,
 		SharedStorageGCInterval:     sharedStorageGCInterval,
 		SharedStorageGCMinAge:       sharedStorageGCMinAge,
+		SharedStorageACRefMaxAge:    sharedStorageACRefMaxAge,
+		SharedStorageGCMaxSize:      sharedStorageGCMaxSize,
+		SharedStorageVerifyInterval: sharedStorageVerifyInterval,
+		BootScanConcurrency:         bootScanConcurrency,
+		GCConcurrency:               gcConcurrency,
 	}
 
 	err := validateConfig(&c)
@@ -316,6 +352,29 @@ func validateConfig(c *Config) error {
 
 	if c.MaxSize <= 0 {
 		return errors.New("the 'max_size' flag/key must be set to a value > 0")
+	}
+
+	if c.SharedStorageVerifyInterval < 0 {
+		return errors.New("'shared_storage_verify_interval' must not be negative")
+	}
+	if c.BootScanConcurrency < 0 {
+		return errors.New("'boot_scan_concurrency' must not be negative")
+	}
+	if c.GCConcurrency < 0 {
+		return errors.New("'gc_concurrency' must not be negative")
+	}
+
+	if c.SharedStorageGCMaxSize < 0 {
+		return errors.New("'shared_storage_gc_max_size' must not be negative")
+	}
+	if c.SharedStorageGCMaxSize > 0 {
+		if !c.SharedStorageLeader {
+			return errors.New("'shared_storage_gc_max_size' only has an effect on the shared storage leader; set 'shared_storage_leader' or remove it")
+		}
+		if int64(c.MaxSize) < c.SharedStorageGCMaxSize {
+			return fmt.Errorf("'shared_storage_gc_max_size' (%d GiB) must not exceed 'max_size' (%d GiB): the GC target is meant to sit below the index capacity, and inverting them means GC never reclaims while the index evicts",
+				c.SharedStorageGCMaxSize, c.MaxSize)
+		}
 	}
 
 	if c.StorageMode != "zstd" && c.StorageMode != "uncompressed" {
@@ -696,5 +755,10 @@ func get(ctx *cli.Context) (*Config, error) {
 		ctx.Bool("shared_storage_leader"),
 		ctx.Duration("shared_storage_gc_interval"),
 		ctx.Duration("shared_storage_gc_min_age"),
+		ctx.Duration("shared_storage_ac_ref_max_age"),
+		ctx.Int64("shared_storage_gc_max_size"),
+		ctx.Duration("shared_storage_verify_interval"),
+		ctx.Int("boot_scan_concurrency"),
+		ctx.Int("gc_concurrency"),
 	)
 }

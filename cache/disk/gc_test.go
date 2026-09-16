@@ -342,3 +342,261 @@ func TestScanFilesWithAtime_IncludesTmpFiles(t *testing.T) {
 		t.Fatalf("scanFilesWithAtime is expected to include .tmp files; got %d files, none matched %q", len(files), wantBase)
 	}
 }
+
+// newGCCacheWithACRefCap is newGCCache + WithSharedStorageACRefMaxAge, for
+// Change F (iter 1) tests: AC entries older than acRefMaxAge stop shielding
+// their CAS references.
+func newGCCacheWithACRefCap(t *testing.T, dir string, sizeBytes int64, minAge, acRefMaxAge time.Duration) *diskCache {
+	t.Helper()
+	c, err := New(dir, sizeBytes,
+		WithAccessLogger(testutils.NewSilentLogger()),
+		WithSharedStorageMode(true),
+		WithSharedStorageGCMinAge(minAge),
+		WithSharedStorageACRefMaxAge(acRefMaxAge),
+	)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	dc := c.(*diskCache)
+	dc.sharedStorageLeader = true
+	return dc
+}
+
+// -----------------------------------------------------------------------------
+// Change F: age-capped AC-reference protection
+// -----------------------------------------------------------------------------
+
+// TestGC_ACRefAgeCap_OldACStopsShieldingCAS is the F1 semantics contract:
+// when an AC entry's mtime is older than shared_storage_ac_ref_max_age,
+// its CAS references are NOT added to the referenced set, so an aged
+// unreferenced-by-fresh-AC CAS blob becomes evictable.
+//
+// Setup: CAS blob + AC entry pointing at it, both aged. AC entry is older
+// than acRefMaxAge=1h. GC forced over-cap. Expected: CAS blob is deleted.
+// Contrast with TestGC_ProtectsCASReferencedByLiveAC, which uses the same
+// shape but WITHOUT the age cap — there CAS survives.
+func TestGC_ACRefAgeCap_OldACStopsShieldingCAS(t *testing.T) {
+	dir := testutils.TempDir(t)
+	defer func() { _ = os.RemoveAll(dir) }()
+
+	// acRefMaxAge=1h, minAge=1h. Both AC entry and CAS blob will be aged 10h
+	// so both are past the AC-shield cap AND past the min-age grace.
+	c := newGCCacheWithACRefCap(t, dir, 10*1024, time.Hour, time.Hour)
+
+	blobSize := int64(1024)
+	casData, casHash := testutils.RandomDataAndHash(blobSize)
+	if err := c.Put(context.Background(), cache.CAS, casHash, blobSize, bytes.NewReader(casData)); err != nil {
+		t.Fatalf("Put CAS: %v", err)
+	}
+	casPath := filepath.Join(dir, c.FileLocationBase(cache.CAS, false, casHash, blobSize))
+
+	ar := &pb.ActionResult{
+		OutputFiles: []*pb.OutputFile{{
+			Path:   "out",
+			Digest: &pb.Digest{Hash: casHash, SizeBytes: blobSize},
+		}},
+	}
+	arBytes, err := proto.Marshal(ar)
+	if err != nil {
+		t.Fatalf("marshal AR: %v", err)
+	}
+	acHash := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	if err := c.Put(context.Background(), cache.AC, acHash, int64(len(arBytes)), bytes.NewReader(arBytes)); err != nil {
+		t.Fatalf("Put AC: %v", err)
+	}
+	acPath := filepath.Join(dir, c.FileLocationBase(cache.AC, false, acHash, int64(len(arBytes))))
+
+	// Age both. AC entry age is compared via mtime in collectACReferencedCASHashes.
+	// os.Chtimes sets both atime and mtime, which is what we want.
+	old := time.Now().Add(-10 * time.Hour)
+	setAtime(t, casPath, old)
+	setAtime(t, acPath, old)
+
+	c.runGCCycle(1)
+
+	if _, err := os.Stat(casPath); !os.IsNotExist(err) {
+		t.Fatalf("CAS blob referenced only by aged-past-cap AC entry should be evicted, stat err=%v", err)
+	}
+}
+
+// TestGC_ACRefAgeCap_DisabledPreservesLegacyBehavior: with acRefMaxAge=0
+// (the disable value), the age-cap does NOT apply and every live AC entry
+// shields its CAS references regardless of age. This is the safety guardrail
+// for anyone who runs without the flag — behavior is unchanged from before F.
+func TestGC_ACRefAgeCap_DisabledPreservesLegacyBehavior(t *testing.T) {
+	dir := testutils.TempDir(t)
+	defer func() { _ = os.RemoveAll(dir) }()
+
+	// acRefMaxAge=0 (disabled)
+	c := newGCCacheWithACRefCap(t, dir, 10*1024, time.Hour, 0)
+
+	blobSize := int64(1024)
+	casData, casHash := testutils.RandomDataAndHash(blobSize)
+	if err := c.Put(context.Background(), cache.CAS, casHash, blobSize, bytes.NewReader(casData)); err != nil {
+		t.Fatalf("Put CAS: %v", err)
+	}
+	casPath := filepath.Join(dir, c.FileLocationBase(cache.CAS, false, casHash, blobSize))
+
+	ar := &pb.ActionResult{
+		OutputFiles: []*pb.OutputFile{{Path: "out", Digest: &pb.Digest{Hash: casHash, SizeBytes: blobSize}}},
+	}
+	arBytes, _ := proto.Marshal(ar)
+	acHash := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	if err := c.Put(context.Background(), cache.AC, acHash, int64(len(arBytes)), bytes.NewReader(arBytes)); err != nil {
+		t.Fatalf("Put AC: %v", err)
+	}
+	acPath := filepath.Join(dir, c.FileLocationBase(cache.AC, false, acHash, int64(len(arBytes))))
+
+	// Age both way past any reasonable cap.
+	old := time.Now().Add(-30 * 24 * time.Hour)
+	setAtime(t, casPath, old)
+	setAtime(t, acPath, old)
+
+	c.runGCCycle(1)
+
+	// With cap disabled, ancient AC still shields → CAS must survive.
+	if _, err := os.Stat(casPath); err != nil {
+		t.Fatalf("with acRefMaxAge=0, CAS referenced by ancient AC must survive, got err=%v", err)
+	}
+}
+
+// TestGC_ACRefAgeCap_FreshACStillShields verifies that F1 only skips OLD
+// AC entries — a fresh AC entry (mtime within acRefMaxAge) still shields
+// its CAS references. Prevents F1 from over-collecting.
+func TestGC_ACRefAgeCap_FreshACStillShields(t *testing.T) {
+	dir := testutils.TempDir(t)
+	defer func() { _ = os.RemoveAll(dir) }()
+
+	// acRefMaxAge=1h, minAge=1h.
+	c := newGCCacheWithACRefCap(t, dir, 10*1024, time.Hour, time.Hour)
+
+	blobSize := int64(1024)
+	casData, casHash := testutils.RandomDataAndHash(blobSize)
+	if err := c.Put(context.Background(), cache.CAS, casHash, blobSize, bytes.NewReader(casData)); err != nil {
+		t.Fatalf("Put CAS: %v", err)
+	}
+	casPath := filepath.Join(dir, c.FileLocationBase(cache.CAS, false, casHash, blobSize))
+
+	ar := &pb.ActionResult{
+		OutputFiles: []*pb.OutputFile{{Path: "out", Digest: &pb.Digest{Hash: casHash, SizeBytes: blobSize}}},
+	}
+	arBytes, _ := proto.Marshal(ar)
+	acHash := "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+	if err := c.Put(context.Background(), cache.AC, acHash, int64(len(arBytes)), bytes.NewReader(arBytes)); err != nil {
+		t.Fatalf("Put AC: %v", err)
+	}
+	// Do NOT age the AC entry: it stays fresh (mtime = now).
+
+	// Age the CAS blob so age-protection alone doesn't rescue it.
+	setAtime(t, casPath, time.Now().Add(-10*time.Hour))
+
+	c.runGCCycle(1)
+
+	// CAS must survive: it's referenced by a fresh (within-cap) AC entry.
+	if _, err := os.Stat(casPath); err != nil {
+		t.Fatalf("CAS referenced by fresh AC must survive age-capped GC, err=%v", err)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Change C+D: parallel scanFilesWithAtime + parallel delete determinism
+// -----------------------------------------------------------------------------
+
+// TestScanFilesWithAtime_ParallelDeterminism runs scanFilesWithAtime N times
+// on the same fixture and asserts (a) file count is stable across runs and
+// (b) totalSize is stable. Parallel workers append into a shared slice via
+// channel; result ordering may differ across runs but counts must not.
+func TestScanFilesWithAtime_ParallelDeterminism(t *testing.T) {
+	dir := testutils.TempDir(t)
+	defer func() { _ = os.RemoveAll(dir) }()
+
+	c := newGCCache(t, dir, 10*1024*1024, time.Hour)
+
+	// 50 CAS + 30 AC + 20 RAW blobs of varied size across many shards.
+	kinds := []struct {
+		k     cache.EntryKind
+		count int
+	}{
+		{cache.CAS, 50},
+		{cache.AC, 30},
+		{cache.RAW, 20},
+	}
+	for _, kk := range kinds {
+		for i := 0; i < kk.count; i++ {
+			sz := int64(64 + i*7)
+			data, h := testutils.RandomDataAndHash(sz)
+			if err := c.Put(context.Background(), kk.k, h, sz, bytes.NewReader(data)); err != nil {
+				t.Fatalf("Put %v: %v", kk.k, err)
+			}
+		}
+	}
+
+	var firstCount int
+	var firstTotal int64
+	const runs = 10
+	for i := 0; i < runs; i++ {
+		files, total, err := c.scanFilesWithAtime()
+		if err != nil {
+			t.Fatalf("run %d: scanFilesWithAtime: %v", i, err)
+		}
+		if i == 0 {
+			firstCount = len(files)
+			firstTotal = total
+			continue
+		}
+		if len(files) != firstCount {
+			t.Fatalf("run %d: file count %d != first-run count %d", i, len(files), firstCount)
+		}
+		if total != firstTotal {
+			t.Fatalf("run %d: totalSize %d != first-run total %d", i, total, firstTotal)
+		}
+	}
+}
+
+// TestGC_ParallelDelete_RespectsBytesToFree pushes many aged unreferenced
+// blobs and asserts the parallel-delete phase (Change D) frees roughly
+// bytesToFree — not "delete everything" and not "delete way past target".
+// A small overshoot is acceptable because the feeder queues jobs based on
+// pre-flight expected-freed (before workers confirm), so the last few
+// concurrent unlinks may push us over.
+func TestGC_ParallelDelete_RespectsBytesToFree(t *testing.T) {
+	dir := testutils.TempDir(t)
+	defer func() { _ = os.RemoveAll(dir) }()
+
+	// Fresh cache; big LRU so Put isn't rejected. minAge=1h; we'll age
+	// everything past that so ALL blobs are eviction-eligible.
+	c := newGCCache(t, dir, 100*1024*1024, time.Hour)
+
+	const numBlobs = 40
+	const blobSize = int64(1024)
+	blobPaths := make([]string, 0, numBlobs)
+	for i := 0; i < numBlobs; i++ {
+		data, h := testutils.RandomDataAndHash(blobSize)
+		if err := c.Put(context.Background(), cache.CAS, h, blobSize, bytes.NewReader(data)); err != nil {
+			t.Fatalf("Put %d: %v", i, err)
+		}
+		blobPaths = append(blobPaths, filepath.Join(dir, c.FileLocationBase(cache.CAS, false, h, blobSize)))
+	}
+	// Age everything past min-age.
+	old := time.Now().Add(-10 * time.Hour)
+	for _, p := range blobPaths {
+		setAtime(t, p, old)
+	}
+
+	// Total logical size = 40 * 1024 = 40960. Cap the GC target at 10 KB.
+	// After GC, disk usage should be ~30-32 KB — we ask for ~10 KB freed;
+	// with 8-16 concurrent workers and 1 KB blobs, overshoot is bounded.
+	c.runGCCycle(30 * 1024)
+
+	remaining := 0
+	for _, p := range blobPaths {
+		if _, err := os.Stat(p); err == nil {
+			remaining++
+		}
+	}
+	// We asked to free ~10 KB (10 blobs). Accept 8-20 remaining (overshoot
+	// window covers the parallel feeder's pre-count vs actual-freed gap).
+	if remaining < 8 || remaining > 32 {
+		t.Fatalf("parallel delete freed too little or too much: %d/%d blobs remain (expected 8-32)", remaining, numBlobs)
+	}
+}

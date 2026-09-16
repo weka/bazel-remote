@@ -57,7 +57,7 @@ log_timezone: local
 		MaxQueuedUploads:            1000000,
 		MaxBlobSize:                 math.MaxInt64,
 		MaxProxyBlobSize:            math.MaxInt64,
-		MetricsDurationBuckets:      []float64{.5, 1, 2.5, 5, 10, 20, 40, 80, 160, 320},
+		MetricsDurationBuckets:      defaultDurationBuckets,
 		AccessLogLevel:              "none",
 		LogTimezone:                 "local",
 	}
@@ -100,7 +100,7 @@ gcs_proxy:
 		MaxQueuedUploads:       1000000,
 		MaxBlobSize:            math.MaxInt64,
 		MaxProxyBlobSize:       math.MaxInt64,
-		MetricsDurationBuckets: []float64{.5, 1, 2.5, 5, 10, 20, 40, 80, 160, 320},
+		MetricsDurationBuckets: defaultDurationBuckets,
 		AccessLogLevel:         "all",
 		LogTimezone:            "UTC",
 	}
@@ -144,7 +144,7 @@ http_proxy:
 		MaxQueuedUploads:       1000000,
 		MaxBlobSize:            math.MaxInt64,
 		MaxProxyBlobSize:       math.MaxInt64,
-		MetricsDurationBuckets: []float64{.5, 1, 2.5, 5, 10, 20, 40, 80, 160, 320},
+		MetricsDurationBuckets: defaultDurationBuckets,
 		AccessLogLevel:         "all",
 		LogTimezone:            "UTC",
 	}
@@ -221,7 +221,7 @@ s3_proxy:
 		MaxQueuedUploads:       1000000,
 		MaxBlobSize:            math.MaxInt64,
 		MaxProxyBlobSize:       math.MaxInt64,
-		MetricsDurationBuckets: []float64{.5, 1, 2.5, 5, 10, 20, 40, 80, 160, 320},
+		MetricsDurationBuckets: defaultDurationBuckets,
 		AccessLogLevel:         "all",
 		LogTimezone:            "UTC",
 	}
@@ -270,7 +270,7 @@ ldap:
 		MaxQueuedUploads:       1000000,
 		MaxBlobSize:            math.MaxInt64,
 		MaxProxyBlobSize:       math.MaxInt64,
-		MetricsDurationBuckets: []float64{.5, 1, 2.5, 5, 10, 20, 40, 80, 160, 320},
+		MetricsDurationBuckets: defaultDurationBuckets,
 		AccessLogLevel:         "all",
 		LogTimezone:            "UTC",
 	}
@@ -304,7 +304,7 @@ profile_address: :7070
 		MaxQueuedUploads:       1000000,
 		MaxBlobSize:            math.MaxInt64,
 		MaxProxyBlobSize:       math.MaxInt64,
-		MetricsDurationBuckets: []float64{.5, 1, 2.5, 5, 10, 20, 40, 80, 160, 320},
+		MetricsDurationBuckets: defaultDurationBuckets,
 		AccessLogLevel:         "all",
 		LogTimezone:            "UTC",
 	}
@@ -484,7 +484,7 @@ storage_mode: zstd
 		MaxQueuedUploads:       1000000,
 		MaxBlobSize:            math.MaxInt64,
 		MaxProxyBlobSize:       math.MaxInt64,
-		MetricsDurationBuckets: []float64{.5, 1, 2.5, 5, 10, 20, 40, 80, 160, 320},
+		MetricsDurationBuckets: defaultDurationBuckets,
 		AccessLogLevel:         "all",
 		LogTimezone:            "UTC",
 	}
@@ -518,7 +518,7 @@ storage_mode: zstd
 		MaxQueuedUploads:       1000000,
 		MaxBlobSize:            math.MaxInt64,
 		MaxProxyBlobSize:       math.MaxInt64,
-		MetricsDurationBuckets: []float64{.5, 1, 2.5, 5, 10, 20, 40, 80, 160, 320},
+		MetricsDurationBuckets: defaultDurationBuckets,
 		AccessLogLevel:         "all",
 		LogTimezone:            "UTC",
 	}
@@ -543,4 +543,82 @@ func TestSocketPathMissing(t *testing.T) {
 	if !strings.Contains(err.Error(), "'http_address'") {
 		t.Fatal("Expected the error message to mention the missing 'http_address' key/flag")
 	}
+}
+
+// TestSharedStorageGCMaxSizeValidation covers the guards on the GC-target flag.
+//
+// The inverted case matters most: a GC target ABOVE max_size is the bug this
+// flag exists to prevent, expressed backwards. GC would never reclaim (the
+// filesystem never reaches the larger target) while the index would still evict
+// at the smaller max_size -- the worst of both behaviours.
+func TestSharedStorageGCMaxSizeValidation(t *testing.T) {
+	base := func() *Config {
+		return &Config{
+			Dir:                    t.TempDir(),
+			MaxSize:                100,
+			StorageMode:            "zstd",
+			ZstdImplementation:     "go",
+			MaxBlobSize:            math.MaxInt64,
+			MaxProxyBlobSize:       math.MaxInt64,
+			MetricsDurationBuckets: defaultDurationBuckets,
+			AccessLogLevel:         "all",
+			LogTimezone:            "UTC",
+			NumUploaders:           100,
+			MaxQueuedUploads:       1000000,
+			HTTPAddress:            "localhost:8080",
+		}
+	}
+
+	t.Run("unset is valid", func(t *testing.T) {
+		c := base()
+		if err := validateConfig(c); err != nil {
+			t.Errorf("unset GC target rejected: %v", err)
+		}
+	})
+
+	t.Run("below max_size on a leader is valid", func(t *testing.T) {
+		c := base()
+		c.SharedStorageLeader = true
+		c.SharedStorageGCMaxSize = 50
+		if err := validateConfig(c); err != nil {
+			t.Errorf("valid GC target rejected: %v", err)
+		}
+	})
+
+	t.Run("equal to max_size on a leader is valid", func(t *testing.T) {
+		c := base()
+		c.SharedStorageLeader = true
+		c.SharedStorageGCMaxSize = 100
+		if err := validateConfig(c); err != nil {
+			t.Errorf("GC target equal to max_size rejected: %v", err)
+		}
+	})
+
+	t.Run("above max_size is rejected", func(t *testing.T) {
+		c := base()
+		c.SharedStorageLeader = true
+		c.SharedStorageGCMaxSize = 200
+		if err := validateConfig(c); err == nil {
+			t.Error("a GC target above max_size was accepted; GC would never " +
+				"reclaim while the index still evicts")
+		}
+	})
+
+	t.Run("set without leader is rejected", func(t *testing.T) {
+		c := base()
+		c.SharedStorageGCMaxSize = 50
+		if err := validateConfig(c); err == nil {
+			t.Error("a GC target on a non-leader was accepted; it has no effect " +
+				"there and silently misleads whoever set it")
+		}
+	})
+
+	t.Run("negative is rejected", func(t *testing.T) {
+		c := base()
+		c.SharedStorageLeader = true
+		c.SharedStorageGCMaxSize = -1
+		if err := validateConfig(c); err == nil {
+			t.Error("a negative GC target was accepted")
+		}
+	})
 }

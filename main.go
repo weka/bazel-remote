@@ -155,6 +155,11 @@ func run(ctx *cli.Context) error {
 		disk.WithSharedStorageLeader(c.SharedStorageLeader),
 		disk.WithSharedStorageGCInterval(c.SharedStorageGCInterval),
 		disk.WithSharedStorageGCMinAge(c.SharedStorageGCMinAge),
+		disk.WithSharedStorageACRefMaxAge(c.SharedStorageACRefMaxAge),
+		disk.WithSharedStorageGCMaxSize(c.SharedStorageGCMaxSize * 1024 * 1024 * 1024),
+		disk.WithSharedStorageVerifyInterval(c.SharedStorageVerifyInterval),
+		disk.WithBootScanConcurrency(c.BootScanConcurrency),
+		disk.WithGCConcurrency(c.GCConcurrency),
 	}
 	if c.ProxyBackend != nil {
 		opts = append(opts, disk.WithProxyBackend(c.ProxyBackend))

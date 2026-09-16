@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/buchgr/bazel-remote/v2/cache"
@@ -61,6 +62,15 @@ func New(dir string, maxSizeBytes int64, opts ...Option) (Cache, error) {
 	if runtime.GOOS == "darwin" {
 		// Mac seems to fail to create os threads when removing
 		// lots of files, so allow fewer than linux.
+		//
+		// NOTE: 3000 still exceeds the default `ulimit -u` on some macOS
+		// setups (2666 observed), which is why running the whole
+		// cache/disk package in one process aborts there with
+		// "pthread_create failed: Resource temporarily unavailable"
+		// before any test reports. Individual suites pass; use -run
+		// filters locally, or run the suite on Linux. A real fix would
+		// clamp this to RLIMIT_NPROC, which needs golang.org/x/sys/unix
+		// since darwin's stdlib syscall package lacks the constant.
 		semaphoreWeight = 3000
 	}
 
@@ -86,9 +96,16 @@ func New(dir string, maxSizeBytes int64, opts ...Option) (Cache, error) {
 		// thread limit.
 		diskWaitSem: semaphore.NewWeighted(semaphoreWeight),
 
+		gcMetrics: newGCMetrics(),
+
 		gaugeCacheAge: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "bazel_remote_disk_cache_longest_item_idle_time_seconds",
-			Help: "The idle time (now - atime) of the last item in the LRU cache, updated once per minute. Depending on filesystem mount options (e.g. relatime), the resolution may be measured in 'days' and not accurate to the second. If using noatime this will be 0.",
+			Help: "The idle time (now - atime) of the last item in the LRU cache, updated once per minute. Depending on filesystem mount options (e.g. relatime), the resolution may be measured in 'days' and not accurate to the second. If using noatime this will be 0. NaN means the value could not be determined; check bazel_remote_disk_cache_longest_item_idle_time_valid.",
+		}),
+
+		gaugeCacheAgeValid: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "bazel_remote_disk_cache_longest_item_idle_time_valid",
+			Help: "1 if bazel_remote_disk_cache_longest_item_idle_time_seconds holds a real measurement, 0 if the least-recently-used item could not be stat'ed. Without this a stale reading is indistinguishable from a current one.",
 		}),
 	}
 
@@ -356,14 +373,57 @@ func (r scanResult) Swap(i, j int) {
 	r.metadata[i], r.metadata[j] = r.metadata[j], r.metadata[i]
 }
 
+// defaultWorkerCap is the historical bound on every scan/GC worker pool:
+// min(NumCPU, 16), floored at 4. Preserved as the default so adding the
+// concurrency flags changes nothing until they are set.
+//
+// Note runtime.NumCPU() reports the HOST's CPUs inside a container, not the
+// cgroup quota, and this binary does not set GOMAXPROCS from the quota either.
+// So on a large node this has always clamped to 16 regardless of the pod's CPU
+// limit, and raising it can oversubscribe that limit into CFS throttling rather
+// than speedup. Measure before raising.
+const defaultWorkerCap = 16
+
+// resolveWorkers applies a configured override, falling back to the historical
+// min(NumCPU, defaultWorkerCap) bound. The floor of 4 is kept in both paths so
+// a tiny machine still makes progress.
+func resolveWorkers(configured int) int {
+	if configured > 0 {
+		if configured < 4 {
+			return 4
+		}
+		return configured
+	}
+	n := runtime.NumCPU()
+	if n < 4 {
+		return 4
+	}
+	if n > defaultWorkerCap {
+		return defaultWorkerCap
+	}
+	return n
+}
+
+// bootScanWorkers is the concurrency of the startup index scan. This pool runs
+// before the server reports ready, so it never competes with client requests --
+// it can be raised more aggressively than the GC pools.
+func (c *diskCache) bootScanWorkers() int {
+	return resolveWorkers(c.bootScanConcurrency)
+}
+
+// gcWorkers is the concurrency of every pool that runs DURING a GC cycle: the
+// filesystem scan, the AC reference collection, and the unlink pool. These run
+// concurrently with client traffic against the same filesystem metadata
+// service, so raising them trades request latency for GC throughput. Kept as
+// one knob because they are sequential phases of a single cycle and there is no
+// evidence yet that they want different values.
+func (c *diskCache) gcWorkers() int {
+	return resolveWorkers(c.gcConcurrency)
+}
+
 func (c *diskCache) scanDir() (scanResult, error) {
 
-	numWorkers := runtime.NumCPU()
-	if numWorkers < 4 {
-		numWorkers = 4
-	} else if numWorkers > 16 {
-		numWorkers = 16 // Consider increasing the upper limit after more testing.
-	}
+	numWorkers := c.bootScanWorkers()
 	log.Println("Scanning cache directory with", numWorkers, "goroutines")
 
 	dc := make(chan string, numWorkers) // Feed directory names to workers.
@@ -453,11 +513,6 @@ func (c *diskCache) scanDir() (scanResult, error) {
 						continue
 					}
 
-					info, err := de.Info()
-					if err != nil {
-						return fmt.Errorf("failed to get file info for %q: %w", path.Join(dirName, name), err)
-					}
-
 					fields := strings.Split(name, "/")
 					file := fields[len(fields)-1]
 
@@ -471,49 +526,79 @@ func (c *diskCache) scanDir() (scanResult, error) {
 						return fmt.Errorf("unrecognized file: %q", path.Join(dirName, name))
 					}
 
+					// Change A: skip the per-file de.Info() stat when the compressed-CAS
+					// filename encodes the size (<hash>-<size> or <hash>-<size>-<random>)
+					// AND we're in shared_storage_mode (per-pod LRU atime ordering is
+					// irrelevant because the leader is the sole GC authority). On WekaFS
+					// this eliminates ~30M stat syscalls per boot on production caches.
+					// sizeOnDisk here becomes the logical (uncompressed) size — an
+					// approximation vs. actual on-disk bytes, acceptable in shared mode
+					// where per-pod byte accounting is not authoritative for GC.
+					skipStat := c.sharedStorageMode &&
+						lookupKeyPrefix == "cas/" &&
+						!legacy &&
+						(len(parts) == 2 || len(parts) == 3)
+
 					item[n] = &item_values[n]
 					metadata[n] = &metadata_values[n]
-
 					metadata[n].lookupKey = lookupKeyPrefix + hash
-
-					item[n].sizeOnDisk = info.Size()
-					item[n].size = info.Size()
 					item[n].random = ""
 					item[n].legacy = legacy
 
-					if lookupKeyPrefix == "cas/" && !legacy {
-						// compressed CAS: <hash>-<size> (deterministic) or
-						// <hash>-<size>-<random> (legacy); a bare <hash> is a
-						// deterministic uncompressed (legacy-format) blob.
-						switch len(parts) {
-						case 1:
-							item[n].legacy = true
-						case 2:
-							item[n].size, err = strconv.ParseInt(parts[1], 10, 64)
-						case 3:
-							item[n].size, err = strconv.ParseInt(parts[1], 10, 64)
-							item[n].random = parts[2]
-						default:
-							return fmt.Errorf("unrecognized file: %q", path.Join(dirName, name))
-						}
-						if err != nil {
+					if skipStat {
+						parsedSize, perr := strconv.ParseInt(parts[1], 10, 64)
+						if perr != nil {
 							return fmt.Errorf("failed to parse size from %q: %w",
-								path.Join(dirName, name), err)
+								path.Join(dirName, name), perr)
 						}
+						item[n].size = parsedSize
+						item[n].sizeOnDisk = parsedSize
+						if len(parts) == 3 {
+							item[n].random = parts[2]
+						}
+						// metadata[n].ts stays at zero value — unused in shared mode.
 					} else {
-						// AC, RAW, or legacy uncompressed CAS:
-						// <hash> (deterministic) or <hash>-<random>.
-						switch len(parts) {
-						case 1:
-							// deterministic; random stays "".
-						case 2:
-							item[n].random = parts[1]
-						default:
-							return fmt.Errorf("unrecognized file: %q", path.Join(dirName, name))
+						info, err := de.Info()
+						if err != nil {
+							return fmt.Errorf("failed to get file info for %q: %w", path.Join(dirName, name), err)
 						}
-					}
 
-					metadata[n].ts = atime.Get(info)
+						item[n].sizeOnDisk = info.Size()
+						item[n].size = info.Size()
+
+						if lookupKeyPrefix == "cas/" && !legacy {
+							// compressed CAS: <hash>-<size> or <hash>-<size>-<random>;
+							// a bare <hash> is a deterministic uncompressed (legacy) blob.
+							switch len(parts) {
+							case 1:
+								item[n].legacy = true
+							case 2:
+								item[n].size, err = strconv.ParseInt(parts[1], 10, 64)
+							case 3:
+								item[n].size, err = strconv.ParseInt(parts[1], 10, 64)
+								item[n].random = parts[2]
+							default:
+								return fmt.Errorf("unrecognized file: %q", path.Join(dirName, name))
+							}
+							if err != nil {
+								return fmt.Errorf("failed to parse size from %q: %w",
+									path.Join(dirName, name), err)
+							}
+						} else {
+							// AC, RAW, or legacy uncompressed CAS:
+							// <hash> (deterministic) or <hash>-<random>.
+							switch len(parts) {
+							case 1:
+								// deterministic; random stays "".
+							case 2:
+								item[n].random = parts[1]
+							default:
+								return fmt.Errorf("unrecognized file: %q", path.Join(dirName, name))
+							}
+						}
+
+						metadata[n].ts = atime.Get(info)
+					}
 
 					n++
 				}
@@ -668,10 +753,18 @@ func (c *diskCache) loadExistingFiles(maxSizeBytes int64, cc CacheConfig) error 
 	for i := 0; i < len(result.item); i++ {
 		ok := c.lru.Add(result.metadata[i].lookupKey, *result.item[i])
 		if !ok {
-			err = os.Remove(filepath.Join(c.dir, result.metadata[i].lookupKey))
-			if err != nil {
-				return err
-			}
+			// Add only refuses an entry larger than the whole cache. The
+			// previous code tried to delete it by joining the cache dir with
+			// the LOOKUP KEY ("cas/<hash>"), which is not a filesystem path --
+			// so the remove always failed with ENOENT, the error propagated,
+			// and New() returned it, meaning the server refused to start over a
+			// single oversized blob.
+			//
+			// Log and skip instead: the blob simply stays on disk unindexed,
+			// and the leader's GC will reclaim it on age like anything else.
+			log.Printf("Warning: cache item %q does not fit in the cache (size %d, max %d); leaving it on disk unindexed",
+				result.metadata[i].lookupKey, result.item[i].sizeOnDisk, c.lru.MaxSize())
+			continue
 		}
 	}
 
@@ -721,12 +814,22 @@ func (c *diskCache) runSharedStorageLeaderGC(maxSizeBytes int64) {
 
 	interval := c.gcInterval()
 
-	log.Printf("Starting shared storage leader GC loop (interval: %v, min age: %v, max size: %.2f GB)",
-		interval, c.gcMinAge(), bytesToGigaBytes(maxSizeBytes))
+	// The GC target is resolved per cycle rather than captured here, so it
+	// always reflects the configured value. maxSizeBytes (the LRU capacity) is
+	// logged alongside it because the relationship between the two is the thing
+	// operators need to see: an index smaller than the filesystem cannot serve
+	// everything the filesystem holds.
+	target := c.gcTargetBytes()
+	log.Printf("Starting shared storage leader GC loop (interval: %v, min age: %v, gc target: %.2f GB, index capacity: %.2f GB)",
+		interval, c.gcMinAge(), bytesToGigaBytes(target), bytesToGigaBytes(maxSizeBytes))
+	if target >= maxSizeBytes {
+		log.Printf("Note: GC target (%.2f GB) is not below the index capacity (%.2f GB), so whenever GC has work to do this replica's index cannot cover the whole filesystem. Set shared_storage_gc_max_size below max_size to separate them.",
+			bytesToGigaBytes(target), bytesToGigaBytes(maxSizeBytes))
+	}
 
 	ticker := time.NewTicker(interval)
 	for range ticker.C {
-		c.runGCCycle(maxSizeBytes)
+		c.runGCCycle(c.gcTargetBytes())
 	}
 }
 
@@ -743,23 +846,90 @@ func (c *diskCache) gcMinAge() time.Duration {
 	return minAge
 }
 
+// gcACRefMaxAge returns the max age for AC entries to shield their CAS
+// references from GC (Change F, iter 1). Zero disables the age cap (legacy
+// behavior: every live AC entry shields its CAS references indefinitely).
+// A non-zero value is floored at 1h to avoid pathological configurations.
+// The intent is to prevent very old AC entries from pinning CAS blobs
+// forever, so aged content can actually drain from the cache.
+func (c *diskCache) gcACRefMaxAge() time.Duration {
+	d := c.sharedStorageACRefMaxAge
+	if d <= 0 {
+		return 0
+	}
+	if d < time.Hour {
+		return time.Hour
+	}
+	return d
+}
+
+// publishInventoryAges converts a completed GC scan into the exported age
+// distribution. The scan already holds each file's atime, so this costs no
+// extra syscalls -- only arithmetic over a slice that is already resident.
+func (c *diskCache) publishInventoryAges(files []fileWithAtime) {
+	now := time.Now()
+	acc := newInventoryAccumulator()
+	for _, f := range files {
+		age := now.Sub(f.atime).Seconds()
+		if age < 0 {
+			// Clock skew between replicas on the shared filesystem, or a blob
+			// whose atime was just refreshed. Treat as brand new.
+			age = 0
+		}
+		acc[kindLabel(f.kind)].observe(age, f.size)
+	}
+	c.gcMetrics.inventory.publish(acc, now)
+}
+
+// recordGCOverrun flags cycles that ran longer than the configured interval.
+// time.Ticker drops ticks silently in that case, so without this a GC that can
+// no longer keep up looks identical to one running on schedule.
+func (c *diskCache) recordGCOverrun(d time.Duration) {
+	if interval := c.gcInterval(); interval > 0 && d > interval {
+		c.gcMetrics.counterOverruns.Inc()
+	}
+}
+
 // runGCCycle performs one garbage collection cycle
 func (c *diskCache) runGCCycle(maxSizeBytes int64) {
+	cycleStart := time.Now()
+
 	// Scan filesystem to get all files with their sizes and atimes
+	scanStart := time.Now()
 	files, totalSize, err := c.scanFilesWithAtime()
 	if err != nil {
 		log.Printf("Warning: failed to scan cache directory for GC: %v", err)
+		c.gcMetrics.counterCycles.WithLabelValues("scan_error").Inc()
 		return
 	}
+	scanSeconds := time.Since(scanStart).Seconds()
+
+	// Publish scan results before any early return. These describe the shared
+	// filesystem rather than this replica's index, and they must be emitted on
+	// every cycle -- including healthy under-target ones -- or the series goes
+	// stale precisely when the cache is fine, and "GC is idle because there is
+	// nothing to do" becomes indistinguishable from "GC stopped running".
+	c.gcMetrics.gaugeScannedBytes.Set(float64(totalSize))
+	c.gcMetrics.gaugeScannedFiles.Set(float64(len(files)))
+	c.gcMetrics.gaugeTargetBytes.Set(float64(maxSizeBytes))
+	c.gcMetrics.gaugePhaseSeconds.WithLabelValues(gcPhaseScan).Set(scanSeconds)
+	c.publishInventoryAges(files)
 
 	if totalSize <= maxSizeBytes {
 		// Under limit, nothing to do
+		c.gcMetrics.counterCycles.WithLabelValues("under_cap").Inc()
+		c.gcMetrics.gaugeEvictableBytes.Set(0)
+		c.gcMetrics.gaugeEvictableFiles.Set(0)
+		c.gcMetrics.gaugePhaseSeconds.WithLabelValues(gcPhaseTotal).Set(time.Since(cycleStart).Seconds())
+		c.recordGCOverrun(time.Since(cycleStart))
 		return
 	}
 
 	bytesToFree := totalSize - maxSizeBytes
-	log.Printf("Shared storage GC: current size %.2f GB exceeds limit %.2f GB, need to free %.2f GB",
-		bytesToGigaBytes(totalSize), bytesToGigaBytes(maxSizeBytes), bytesToGigaBytes(bytesToFree))
+	acRefMaxAge := c.gcACRefMaxAge()
+	log.Printf("Shared storage GC: current size %.2f GB exceeds limit %.2f GB, need to free %.2f GB (ac_ref_max_age=%v, min_age=%v)",
+		bytesToGigaBytes(totalSize), bytesToGigaBytes(maxSizeBytes), bytesToGigaBytes(bytesToFree),
+		acRefMaxAge, c.gcMinAge())
 
 	// Build the set of CAS blobs referenced by live Action Cache entries.
 	// These must never be evicted: as long as an action result is cached, its
@@ -767,7 +937,12 @@ func (c *diskCache) runGCCycle(maxSizeBytes int64) {
 	// the outputs mid-build. AC entries themselves are evictable (a missing AC
 	// entry is just a cache miss that re-runs the action), so orphaned outputs
 	// become collectable on a later cycle once their AC entry is gone.
+	// Change F: AC entries older than acRefMaxAge do not shield their CAS.
+	collectStart := time.Now()
 	referenced := c.collectACReferencedCASHashes()
+	c.gcMetrics.gaugePhaseSeconds.WithLabelValues(gcPhaseCollectAC).Set(time.Since(collectStart).Seconds())
+	c.gcMetrics.gaugeACRefHashes.Set(float64(len(referenced)))
+	log.Printf("Shared storage GC: AC-referenced CAS set contains %d hashes", len(referenced))
 
 	// Sort files by atime (oldest first)
 	sort.Slice(files, func(i, j int) bool {
@@ -779,18 +954,76 @@ func (c *diskCache) runGCCycle(maxSizeBytes int64) {
 	// references are not visible to the leader.
 	cutoff := time.Now().Add(-c.gcMinAge())
 
-	// Delete oldest files until we've freed enough space
-	var freed int64
-	var deletedCount int
+	// Change D: parallelize os.Remove via a bounded worker pool. Serial unlink
+	// on WekaFS at ~1-3 ms/op means multi-hour delete phases for TB-scale
+	// eviction; parallel pool at N=16 keeps instantaneous metadata pressure
+	// bounded while cutting wall-clock ~10×.
+	numDeleters := c.gcWorkers()
+
+	deleteStart := time.Now()
+
+	type deleteJob struct {
+		path string
+		size int64
+	}
+	jobs := make(chan deleteJob, numDeleters*2)
+	var actualFreed atomic.Int64
+	var actualDeleted atomic.Int64
+	var deleteErrs atomic.Int64
+
+	var deleterWG sync.WaitGroup
+	for i := 0; i < numDeleters; i++ {
+		deleterWG.Add(1)
+		go func() {
+			defer deleterWG.Done()
+			pending := make([]string, 0, gcLRURemovalBatch)
+			defer func() { c.flushLRURemovals(pending) }()
+
+			for j := range jobs {
+				if key, ok := c.lruKeyForPath(j.path); ok {
+					pending = append(pending, key)
+					if len(pending) >= gcLRURemovalBatch {
+						c.flushLRURemovals(pending)
+						pending = pending[:0]
+					}
+				}
+				if err := os.Remove(j.path); err != nil {
+					if !os.IsNotExist(err) {
+						log.Printf("Warning: failed to remove file during GC: %s: %v", j.path, err)
+						deleteErrs.Add(1)
+					}
+					continue
+				}
+				actualFreed.Add(j.size)
+				actualDeleted.Add(1)
+			}
+		}()
+	}
+
+	// Feeder: walks pre-sorted files in-order and queues eligible ones for
+	// deletion until the running expected-freed counter meets bytesToFree.
+	// Running the feeder here (not in a worker) keeps protection accounting
+	// serial and avoids over-deletion beyond bytesToFree + a small in-flight
+	// margin of ~numDeleters * avgFileSize.
+	var expectedFreed int64
 	var ageProtBytes int64
 	var ageProtCount int
 	var refProtBytes int64
 	var refProtCount int
+	var evictableBytes int64
+	var evictableCount int
+	// Classify every file, but stop queueing deletions once the target is met.
+	//
+	// The classification used to stop at the same point as the feeding, which
+	// made the protection totals "whatever was seen before we had freed
+	// enough" rather than actual totals -- so the shortfall warning below (and
+	// any metric derived from it) understated how much was protected, by an
+	// amount that varied with how early the loop happened to break. The extra
+	// work is an in-memory pass over a slice already resident, and it yields
+	// the evictable totals, which are what reveal a GC that cannot make
+	// progress because retention is protecting everything.
+	feeding := true
 	for _, f := range files {
-		if freed >= bytesToFree {
-			break
-		}
-
 		// Blobs younger than the grace window are protected from eviction.
 		if f.atime.After(cutoff) {
 			ageProtBytes += f.size
@@ -798,7 +1031,8 @@ func (c *diskCache) runGCCycle(maxSizeBytes int64) {
 			continue
 		}
 
-		// CAS blobs referenced by a live AC entry are protected regardless of age.
+		// CAS blobs referenced by a (fresh-enough, per Change F) AC entry
+		// are protected regardless of age.
 		if f.kind == cache.CAS && f.hash != "" {
 			if _, ok := referenced[f.hash]; ok {
 				refProtBytes += f.size
@@ -807,29 +1041,44 @@ func (c *diskCache) runGCCycle(maxSizeBytes int64) {
 			}
 		}
 
-		// Remove from our LRU if present (best effort, may not be in our index)
-		c.removeFromLRUByPath(f.path)
+		evictableBytes += f.size
+		evictableCount++
 
-		// Delete the file
-		err := os.Remove(f.path)
-		if err != nil {
-			if !os.IsNotExist(err) {
-				log.Printf("Warning: failed to remove file during GC: %s: %v", f.path, err)
+		if feeding {
+			jobs <- deleteJob{path: f.path, size: f.size}
+			expectedFreed += f.size
+			if expectedFreed >= bytesToFree {
+				feeding = false
 			}
-			continue
 		}
-
-		freed += f.size
-		deletedCount++
 	}
+	close(jobs)
+	deleterWG.Wait()
+
+	freed := actualFreed.Load()
+	deletedCount := actualDeleted.Load()
+
+	c.gcMetrics.gaugePhaseSeconds.WithLabelValues(gcPhaseDelete).Set(time.Since(deleteStart).Seconds())
+	c.gcMetrics.counterBytesFreed.Add(float64(freed))
+	c.gcMetrics.counterFilesDelete.Add(float64(deletedCount))
+	c.gcMetrics.counterDeleteErrs.Add(float64(deleteErrs.Load()))
+	c.gcMetrics.counterCycles.WithLabelValues("freed").Inc()
+	c.gcMetrics.gaugeEvictableBytes.Set(float64(evictableBytes))
+	c.gcMetrics.gaugeEvictableFiles.Set(float64(evictableCount))
+	c.gcMetrics.gaugeProtectedBytes.WithLabelValues(gcReasonMinAge).Set(float64(ageProtBytes))
+	c.gcMetrics.gaugeProtectedFiles.WithLabelValues(gcReasonMinAge).Set(float64(ageProtCount))
+	c.gcMetrics.gaugeProtectedBytes.WithLabelValues(gcReasonACRef).Set(float64(refProtBytes))
+	c.gcMetrics.gaugeProtectedFiles.WithLabelValues(gcReasonACRef).Set(float64(refProtCount))
+	c.gcMetrics.gaugePhaseSeconds.WithLabelValues(gcPhaseTotal).Set(time.Since(cycleStart).Seconds())
+	c.recordGCOverrun(time.Since(cycleStart))
 
 	log.Printf("Shared storage GC: freed %.2f GB by deleting %d files (protected: %d AC-referenced, %d within min-age)",
 		bytesToGigaBytes(freed), deletedCount, refProtCount, ageProtCount)
 
 	if freed < bytesToFree {
 		log.Printf("Warning: shared storage GC could not free enough space: %.2f GB still over limit "+
-			"(%.2f GB AC-referenced, %.2f GB within %v min-age are protected). Consider raising max size.",
-			bytesToGigaBytes(bytesToFree-freed), bytesToGigaBytes(refProtBytes), bytesToGigaBytes(ageProtBytes), c.gcMinAge())
+			"(%.2f GB AC-referenced, %.2f GB within %v min-age are protected). Consider raising max size, lowering shared_storage_ac_ref_max_age (currently %v), or lowering shared_storage_gc_min_age.",
+			bytesToGigaBytes(bytesToFree-freed), bytesToGigaBytes(refProtBytes), bytesToGigaBytes(ageProtBytes), c.gcMinAge(), acRefMaxAge)
 	}
 }
 
@@ -838,44 +1087,186 @@ func (c *diskCache) runGCCycle(maxSizeBytes int64) {
 // files, the tree blob (and the files within it) for each output directory,
 // and the stdout/stderr blobs. GC must not evict any of these while the
 // referencing AC entry exists.
+//
+// Change E (iter 1): worker pool over ac.v2 shard directories parallelizes
+// the AC read+unmarshal phase and a second bounded pool parallelizes the
+// tree-Get phase. Serial filepath.Walk on production-scale AC (~10M entries
+// on rnd) was multi-hour; parallel workers cut it to minutes.
+//
+// Change F (iter 1): if sharedStorageACRefMaxAge > 0, AC entries whose file
+// mtime is older than that threshold are skipped entirely — their CAS
+// references are NOT added to the returned set. This unpins ancient CAS
+// blobs that were being shielded by long-cold AC entries.
 func (c *diskCache) collectACReferencedCASHashes() map[string]struct{} {
 	referenced := make(map[string]struct{})
 	acDir := filepath.Join(c.dir, "ac.v2")
 
-	_ = filepath.Walk(acDir, func(p string, info os.FileInfo, err error) error {
-		if err != nil || info.IsDir() {
-			return nil
-		}
+	numWorkers := c.gcWorkers()
 
-		data, err := os.ReadFile(p)
-		if err != nil {
-			return nil
-		}
+	// Change F: cutoff for age-cap. Zero-value time means "no cap".
+	var acCutoff time.Time
+	if maxAge := c.gcACRefMaxAge(); maxAge > 0 {
+		acCutoff = time.Now().Add(-maxAge)
+	}
 
-		ar := &pb.ActionResult{}
-		if err := proto.Unmarshal(data, ar); err != nil {
-			return nil // Not a parseable ActionResult; skip.
-		}
+	type shardResult struct {
+		refs         map[string]struct{}
+		treeDigests  []*pb.Digest
+		skippedByAge int
+		unparseable  int
+	}
 
-		for _, f := range ar.OutputFiles {
-			if f.Digest != nil {
-				referenced[f.Digest.Hash] = struct{}{}
+	shardJobs := make(chan string, numWorkers)
+	results := make(chan shardResult, numWorkers)
+
+	var allTreeDigests []*pb.Digest
+	var skippedByAgeTotal int
+	var unparseableTotal int
+	receiverDone := make(chan struct{})
+	go func() {
+		for sr := range results {
+			for h := range sr.refs {
+				referenced[h] = struct{}{}
 			}
+			allTreeDigests = append(allTreeDigests, sr.treeDigests...)
+			skippedByAgeTotal += sr.skippedByAge
+			unparseableTotal += sr.unparseable
 		}
-		for _, d := range ar.OutputDirectories {
-			if d.TreeDigest != nil {
-				referenced[d.TreeDigest.Hash] = struct{}{}
-				c.markTreeFiles(d.TreeDigest, referenced)
+		close(receiverDone)
+	}()
+
+	var acWorkers sync.WaitGroup
+	for i := 0; i < numWorkers; i++ {
+		acWorkers.Add(1)
+		go func() {
+			defer acWorkers.Done()
+			for shardDir := range shardJobs {
+				sr := shardResult{refs: make(map[string]struct{})}
+				des, err := os.ReadDir(shardDir)
+				if err != nil {
+					log.Printf("Warning: collectACReferencedCASHashes: read shard %q: %v", shardDir, err)
+					results <- sr
+					continue
+				}
+				for _, de := range des {
+					if de.IsDir() {
+						continue
+					}
+					p := filepath.Join(shardDir, de.Name())
+
+					// Change F: skip AC entries older than the cap.
+					if !acCutoff.IsZero() {
+						info, ierr := de.Info()
+						if ierr != nil {
+							continue // deleted between ReadDir and Info
+						}
+						if info.ModTime().Before(acCutoff) {
+							sr.skippedByAge++
+							continue
+						}
+					}
+
+					data, err := os.ReadFile(p)
+					if err != nil {
+						continue
+					}
+					ar := &pb.ActionResult{}
+					if err := proto.Unmarshal(data, ar); err != nil {
+						sr.unparseable++
+						continue
+					}
+					for _, of := range ar.OutputFiles {
+						if of.Digest != nil {
+							sr.refs[of.Digest.Hash] = struct{}{}
+						}
+					}
+					for _, d := range ar.OutputDirectories {
+						if d.TreeDigest != nil {
+							sr.refs[d.TreeDigest.Hash] = struct{}{}
+							sr.treeDigests = append(sr.treeDigests, d.TreeDigest)
+						}
+					}
+					if ar.StdoutDigest != nil {
+						sr.refs[ar.StdoutDigest.Hash] = struct{}{}
+					}
+					if ar.StderrDigest != nil {
+						sr.refs[ar.StderrDigest.Hash] = struct{}{}
+					}
+				}
+				results <- sr
 			}
+		}()
+	}
+
+	// Feed shard directories.
+	shards, err := os.ReadDir(acDir)
+	if err != nil {
+		log.Printf("Warning: collectACReferencedCASHashes: read %q: %v", acDir, err)
+	} else {
+		for _, shard := range shards {
+			if !shard.IsDir() {
+				continue
+			}
+			shardJobs <- filepath.Join(acDir, shard.Name())
 		}
-		if ar.StdoutDigest != nil {
-			referenced[ar.StdoutDigest.Hash] = struct{}{}
+	}
+	close(shardJobs)
+
+	acWorkers.Wait()
+	close(results)
+	<-receiverDone
+
+	if skippedByAgeTotal > 0 || unparseableTotal > 0 {
+		log.Printf("collectACReferencedCASHashes: %d AC entries skipped by age cap, %d unparseable",
+			skippedByAgeTotal, unparseableTotal)
+	}
+
+	// Deduplicate tree digests before the tree-walk phase — many AC entries
+	// share the same OutputDirectory Tree, and c.Get + decompress per tree is
+	// expensive.
+	seenTrees := make(map[string]struct{}, len(allTreeDigests))
+	dedupedTrees := allTreeDigests[:0]
+	for _, td := range allTreeDigests {
+		if td == nil {
+			continue
 		}
-		if ar.StderrDigest != nil {
-			referenced[ar.StderrDigest.Hash] = struct{}{}
+		if _, ok := seenTrees[td.Hash]; ok {
+			continue
 		}
-		return nil
-	})
+		seenTrees[td.Hash] = struct{}{}
+		dedupedTrees = append(dedupedTrees, td)
+	}
+
+	if len(dedupedTrees) == 0 {
+		return referenced
+	}
+
+	treeJobs := make(chan *pb.Digest, numWorkers)
+	var treeMu sync.Mutex
+	var treeWorkers sync.WaitGroup
+	for i := 0; i < numWorkers; i++ {
+		treeWorkers.Add(1)
+		go func() {
+			defer treeWorkers.Done()
+			localRefs := make(map[string]struct{})
+			for td := range treeJobs {
+				c.markTreeFiles(td, localRefs)
+			}
+			if len(localRefs) == 0 {
+				return
+			}
+			treeMu.Lock()
+			for h := range localRefs {
+				referenced[h] = struct{}{}
+			}
+			treeMu.Unlock()
+		}()
+	}
+	for _, td := range dedupedTrees {
+		treeJobs <- td
+	}
+	close(treeJobs)
+	treeWorkers.Wait()
 
 	return referenced
 }
@@ -917,15 +1308,104 @@ func (c *diskCache) markTreeFiles(treeDigest *pb.Digest, referenced map[string]s
 	}
 }
 
-// scanFilesWithAtime scans the cache directory and returns all files with their atimes
+// scanFilesWithAtime scans the cache directory and returns all files with their atimes.
+//
+// Change C (iter 1): worker pool over <kind>.v2/<xx> shard directories, mirroring
+// scanDir's parallelism pattern. Each worker os.ReadDir's a shard and stats each
+// entry to capture size + atime (both required by runGCCycle — atime is the sort
+// key and the min-age cutoff input; size is the eviction accounting). Result
+// ordering doesn't matter — runGCCycle does its own sort.Slice.
+//
+// Note: unlike scanDir's Change A, we cannot skip the per-file stat here — atime
+// is load-bearing for GC eviction ordering and the grace-window cutoff.
 func (c *diskCache) scanFilesWithAtime() ([]fileWithAtime, int64, error) {
-	var files []fileWithAtime
-	var totalSize int64
+	numWorkers := c.gcWorkers()
 
-	// Walk through all cache directories
+	type shardJob struct {
+		dir  string
+		kind cache.EntryKind
+	}
+
+	jobs := make(chan shardJob, numWorkers)
+	results := make(chan []fileWithAtime, numWorkers)
+
+	var totalSize atomic.Int64
+
+	var finalFiles []fileWithAtime
+	receiverDone := make(chan struct{})
+	go func() {
+		for batch := range results {
+			finalFiles = append(finalFiles, batch...)
+		}
+		close(receiverDone)
+	}()
+
+	workers := new(errgroup.Group)
+	for i := 0; i < numWorkers; i++ {
+		workers.Go(func() error {
+			for job := range jobs {
+				des, err := os.ReadDir(job.dir)
+				if err != nil {
+					return fmt.Errorf("scanFilesWithAtime: read shard %q: %w", job.dir, err)
+				}
+				batch := make([]fileWithAtime, 0, len(des))
+				var batchSize int64
+				for _, de := range des {
+					if de.IsDir() {
+						continue
+					}
+					info, err := de.Info()
+					if err != nil {
+						// File may have been unlinked between ReadDir and Info
+						// (e.g., by a concurrent request Put's overwrite path).
+						// Skip silently — matches the prior filepath.Walk
+						// behavior which returned nil on walk errors.
+						if os.IsNotExist(err) {
+							continue
+						}
+						return fmt.Errorf("scanFilesWithAtime: stat %q: %w", filepath.Join(job.dir, de.Name()), err)
+					}
+					name := de.Name()
+					full := filepath.Join(job.dir, name)
+
+					// Slice the hash out of `full`, not out of `name`.
+					//
+					// A Go string slice shares its backing array with the
+					// original, so `name[:64]` keeps the whole de.Name()
+					// allocation alive for as long as the entry is retained.
+					// The scan holds every entry until the cycle ends, so at
+					// production scale (tens of millions of files) that pins an
+					// extra ~75 bytes per file -- gigabytes of otherwise dead
+					// string data, on a process whose peak RSS is already the
+					// binding constraint. `full` is retained regardless, so
+					// slicing from it costs nothing extra.
+					hash := ""
+					if len(name) >= sha256HashStrSize {
+						start := len(full) - len(name)
+						hash = full[start : start+sha256HashStrSize]
+					}
+					batch = append(batch, fileWithAtime{
+						path:  full,
+						size:  info.Size(),
+						atime: atime.Get(info),
+						kind:  job.kind,
+						hash:  hash,
+					})
+					batchSize += info.Size()
+				}
+				totalSize.Add(batchSize)
+				results <- batch
+			}
+			return nil
+		})
+	}
+
+	// Feeder: enumerate <kind>.v2/<xx> shard directories and enqueue. Baseline
+	// shard-level topology matches scanDir's expectations (2-level layout);
+	// unexpected nesting under a shard is not walked here — see scanDir for
+	// strict validation of the on-disk layout at boot.
+	var feedErr error
 	for _, kindDir := range []string{"ac.v2", "cas.v2", "raw.v2"} {
-		baseDir := filepath.Join(c.dir, kindDir)
-
 		var kind cache.EntryKind
 		switch kindDir {
 		case "ac.v2":
@@ -935,53 +1415,48 @@ func (c *diskCache) scanFilesWithAtime() ([]fileWithAtime, int64, error) {
 		default:
 			kind = cache.RAW
 		}
-
-		err := filepath.Walk(baseDir, func(path string, info os.FileInfo, err error) error {
-			if err != nil {
-				return nil // Skip errors, continue walking
-			}
-
-			if info.IsDir() {
-				return nil
-			}
-
-			hash := ""
-			if name := info.Name(); len(name) >= sha256HashStrSize {
-				hash = name[:sha256HashStrSize]
-			}
-
-			files = append(files, fileWithAtime{
-				path:  path,
-				size:  info.Size(),
-				atime: atime.Get(info),
-				kind:  kind,
-				hash:  hash,
-			})
-			totalSize += info.Size()
-
-			return nil
-		})
-
+		baseDir := filepath.Join(c.dir, kindDir)
+		shards, err := os.ReadDir(baseDir)
 		if err != nil {
-			return nil, 0, err
+			feedErr = fmt.Errorf("scanFilesWithAtime: read %q: %w", baseDir, err)
+			break
+		}
+		for _, shard := range shards {
+			if !shard.IsDir() {
+				continue
+			}
+			jobs <- shardJob{dir: filepath.Join(baseDir, shard.Name()), kind: kind}
 		}
 	}
+	close(jobs)
 
-	return files, totalSize, nil
+	workerErr := workers.Wait()
+	close(results)
+	<-receiverDone
+
+	if feedErr != nil {
+		return nil, 0, feedErr
+	}
+	if workerErr != nil {
+		return nil, 0, workerErr
+	}
+	return finalFiles, totalSize.Load(), nil
 }
 
 // removeFromLRUByPath attempts to remove a file from the LRU by its path
-func (c *diskCache) removeFromLRUByPath(filePath string) {
-	// Parse the path to extract kind and hash
-	// Path format: <dir>/<kind>.v2/<prefix>/<hash>-<random> or <hash>-<size>-<random>
+// lruKeyForPath derives the index key for a file the GC is deleting. Pure
+// parsing, no locking, so callers can batch the locked part.
+//
+// Path format: <dir>/<kind>.v2/<prefix>/<hash>[-<size>][-<random>]
+func (c *diskCache) lruKeyForPath(filePath string) (string, bool) {
 	rel, err := filepath.Rel(c.dir, filePath)
 	if err != nil {
-		return
+		return "", false
 	}
 
 	parts := strings.Split(rel, string(filepath.Separator))
 	if len(parts) < 3 {
-		return
+		return "", false
 	}
 
 	kindDir := parts[0]
@@ -996,17 +1471,46 @@ func (c *diskCache) removeFromLRUByPath(filePath string) {
 	case "raw.v2":
 		kind = cache.RAW
 	default:
-		return
+		return "", false
 	}
 
 	// Extract hash from filename (first 64 hex chars)
-	if len(filename) < 64 {
+	if len(filename) < sha256HashStrSize {
+		return "", false
+	}
+
+	return cache.LookupKey(kind, filename[:sha256HashStrSize]), true
+}
+
+// gcLRURemovalBatch is how many index keys a GC delete worker accumulates
+// before taking the cache mutex to drop them.
+//
+// c.mu is the global cache lock, contended by every request. Removing entries
+// one at a time meant one acquisition per deleted file: a production cycle has
+// deleted 7.28M files, so that is 7.28M acquisitions by 16 workers, serialised
+// against live traffic. Batching trades a bounded amount of index staleness
+// (at most this many entries still naming files already unlinked, briefly) for
+// three orders of magnitude fewer acquisitions. The stale window is safe --
+// Contains and FindMissingBlobs both verify against the filesystem before
+// trusting an index hit.
+const gcLRURemovalBatch = 1000
+
+// flushLRURemovals drops a batch of index entries under a single lock.
+//
+// NoEvict throughout: the GC unlinks these files itself, so queueing an
+// eviction would ask onEvict to remove a file that is already gone, and would
+// add their bytes to counterEvictedBytes and queuedEvictionsSize.
+// queuedEvictionsSize feeds calcTotalDiskSizeAndUpdatePeak, so at GC scale that
+// inflates bazel_remote_disk_cache_size_bytes by the entire deleted volume and,
+// with max_size_hard_limit configured, would make Reserve reject writes for the
+// duration of every GC cycle.
+func (c *diskCache) flushLRURemovals(keys []string) {
+	if len(keys) == 0 {
 		return
 	}
-	hash := filename[:64]
-
-	key := cache.LookupKey(kind, hash)
 	c.mu.Lock()
-	c.lru.RemoveKey(key)
+	for _, k := range keys {
+		c.lru.RemoveKeyNoEvict(k)
+	}
 	c.mu.Unlock()
 }
